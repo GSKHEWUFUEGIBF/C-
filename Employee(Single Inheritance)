@@ -1,0 +1,48 @@
+#include <iostream>
+#include <string>
+
+using namespace std;
+
+class Employee {
+protected:
+    int empID;
+    string name;
+public:
+    void getEmployeeDetails() {
+        cout << "Enter Employee ID: ";
+        cin >> empID;
+        cout << "Enter Name: ";
+        getline(cin >> ws, name);
+    }
+    void displayEmployeeDetails() {
+        cout << "Employee ID: " << empID << endl;
+        cout << "Name: " << name << endl;
+    }
+};
+
+class Salary : public Employee {
+private:
+    double basicPay;
+public:
+    void getSalaryDetails() {
+        getEmployeeDetails();
+        cout << "Enter Basic Monthly Pay: ";
+        cin >> basicPay;
+    }
+    void displaySalarySlip() {
+        displayEmployeeDetails();
+        cout << "Monthly Basic Pay: $" << basicPay << endl;
+        cout << "Calculated Annual Salary: $" << (basicPay * 12) << endl;
+    }
+};
+
+int main() {
+    Salary e;
+    cout << "--- Enter Employee Details ---" << endl;
+    e.getSalaryDetails();
+    
+    cout << "\n--- Salary & Employee Information ---" << endl;
+    e.displaySalarySlip();
+    
+    return 0;
+}
