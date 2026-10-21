@@ -41,6 +41,7 @@ except ImportError:  # demo mode still works
 # --------------------------------------------------------------------------- #
 F_GRID = 50.0
 CAP_UF = (2.5, 10.0, 20.0)
+CAP_RECLOSE_S = 3.0          # firmware CAP_RECLOSE_MS: discharge guard before a cap re-closes
 N_H = 15
 M_KEYS = ("vrms", "irms", "p", "s", "q", "pf", "thd_v", "thd_i", "crest",
           "vpk", "ipk", "dpf", "dva")
@@ -330,6 +331,8 @@ class DemoLink(threading.Thread):
         cur = (self.target & ~self.lock_mask) | (self.lock_state & self.lock_mask)
         q_load = q1 + k_var * self._cap(self.relays)
         self.c_need = max((q_load - abs(p1) * math.sqrt(1 - 0.95 ** 2) / 0.95) / k_var, 0.0)
+        if self.lock_mask == 7:     # all manual: firmware reports the locked bank as "required"
+            self.c_need = self._cap(self.lock_state)
         combos = [st for st in range(8) if (st & self.lock_mask) == (self.lock_state & self.lock_mask)]
         best = min(combos, key=lambda st: (abs(self._cap(st) - self.c_need), bin(st ^ cur).count("1")))
         e_cur = abs(self._cap(cur) - self.c_need)
@@ -339,7 +342,7 @@ class DemoLink(threading.Thread):
             self.target, self.hold = cur, 1
         for idx in range(3):
             b = 1 << idx
-            if self.target & b and not self.relays & b and now - self.off_t[idx] >= 0.5:
+            if self.target & b and not self.relays & b and now - self.off_t[idx] >= CAP_RECLOSE_S:
                 self.relays |= b
             elif not self.target & b and self.relays & b:
                 self.relays &= ~b
@@ -1119,7 +1122,7 @@ class Dashboard(QtWidgets.QMainWindow):
             on, locked, want = st >> j & 1, mask >> j & 1, tgt >> j & 1
             state = "ON" if on else "OFF"
             if want != on:
-                state += " → ON" if want else " → OFF"
+                state += " → ON (guard)" if want else " → OFF"
             b.setText("%g µF\n%s · %s" % (CAP_UF[j], "MAN" if locked else "AUTO", state))
             face, edge = ("#e7f6ee", "#9fd8bd") if on else (CARD, "#d6d9de")
             if locked:
@@ -1127,8 +1130,9 @@ class Dashboard(QtWidgets.QMainWindow):
             _css(b, _btn_style(face, edge, C_GOOD if on else FG2, 2 if locked else 1))
         self.bank_sub.setText("%d of 3 on" % bin(st).count("1"))
         self.apfc_txt.setText("Controller: <b>%s</b>  ·  installed %.1f µF  ·  required %.2f µF<br>"
-                              "Click a step to override it; click again to cycle MAN ON → MAN OFF → AUTO."
-                              % ("HOLD" if int(pfc["hold"]) else "SWITCHING", pfc["cap"], pfc["c_need"]))
+                              "Click a step to override it; click again to cycle MAN ON → MAN OFF → AUTO.<br>"
+                              "A capacitor that was just switched off waits %g s before it can close again."
+                              % ("HOLD" if int(pfc["hold"]) else "SWITCHING", pfc["cap"], pfc["c_need"], CAP_RECLOSE_S))
 
         if self.hist:
             h = np.asarray(self.hist)
