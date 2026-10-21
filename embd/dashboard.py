@@ -48,9 +48,9 @@ CAP_UF = (2.5, 10.0, 20.0)
 CAP_RECLOSE_S = 3.0          # firmware CAP_RECLOSE_MS: discharge guard before a cap re-closes
 N_H = 15
 M_KEYS = ("vrms", "irms", "p", "s", "q", "pf", "thd_v", "thd_i", "crest",
-          "vpk", "ipk", "dpf", "dva")
+          "vpk", "ipk", "dpf", "dva", "freq")
 P_KEYS = ("state", "cap", "pf", "q", "hold", "target", "c_need")
-A_KEYS = ("active", "peak", "ref_peak", "depth", "adv")
+A_KEYS = ("active", "peak", "ref_peak", "duty", "resid")   # duty: table peak, resid: loop error %
 K_KEYS = ("mask", "state", "ok", "bad", "rx")
 R_KEYS = ("off_v", "min_v", "max_v", "clip_v", "off_i", "min_i", "max_i", "clip_i",
           "off_a", "min_a", "max_a", "clip_a", "adc_ovr", "win_drop", "tx_skip")
@@ -319,17 +319,19 @@ class DemoLink(threading.Thread):
         tref = -(i - i1)
 
         pk = np.max(np.abs(tref))
-        if self.ahf_on and pk > 0.02:
-            drive = 0.92 * tref / pk
+        if self.ahf_on and pk > 0.02:     # converged selective-harmonic loop: h2..h15 only
             f = np.fft.rfftfreq(n, 1.0 / (n * F_GRID))
-            a = 0.85 * np.fft.irfft(np.fft.rfft(drive) / (1 + 1j * f / 1500.0), n)
+            a = np.fft.irfft(np.fft.rfft(tref) * np.where((f > 75) & (f < 775), 0.97, 0.0), n)
+            duty = min(0.92, 0.35 * np.max(np.abs(a)))
         else:
-            a = np.zeros(n)
+            a, duty = np.zeros(n), 0.0
         a = a + rng.normal(0, 0.006, n)
         aa, ba = self._dft(a)
         ha = np.hypot(aa, ba) / math.sqrt(2)
+        resid = 100.0 * math.sqrt(np.sum(np.hypot(ai[1:] + aa[1:], bi[1:] + ba[1:]) ** 2)
+                                  / max(np.sum(np.hypot(ai[1:], bi[1:]) ** 2), 1e-12))
 
-        i_corr = i1 if self.ahf_on else i
+        i_corr = i + a                    # firmware sends I + A (measured)
 
         k_var = w * vrms * vrms * 1e-6
         cur = (self.target & ~self.lock_mask) | (self.lock_state & self.lock_mask)
@@ -366,12 +368,14 @@ class DemoLink(threading.Thread):
             "$W,T," + wv(tref, 3), "$W,C," + wv(i_corr, 3),
             "$M," + ",".join("%.4f" % x for x in (vrms, irms, p, s, q1, pf, thd(hv), thd(hi),
                                                   np.max(np.abs(i)) / irms, np.max(np.abs(v)),
-                                                  np.max(np.abs(i)), dpf, dva)),
+                                                  np.max(np.abs(i)), dpf, dva,
+                                                  F_GRID + 0.03 * math.sin(t / 20))),
             "$H,I," + ",".join("%.4f" % x for x in hi),
             "$H,A," + ",".join("%.4f" % x for x in ha),
             "$P,%d,%.1f,%.4f,%.2f,%d,%d,%.2f" % (self.relays, self._cap(self.relays), pf, q1,
                                                  self.hold, self.target, self.c_need),
-            "$A,%d,%.4f,%.4f,0.92,0" % (self.ahf_on, np.max(np.abs(a)), pk),
+            "$A,%d,%.4f,%.4f,%.3f,%.1f" % (self.ahf_on, np.max(np.abs(a)), pk, duty,
+                                            resid if self.ahf_on else 0.0),
             "$K,%d,%d,%d,%d,%d" % (self.lock_mask, self.lock_state, self.ok, self.bad, self.rx),
             "$R," + raw(v, 3.3 / 4095 * 1014) + "," + raw(i, k_i) + "," + raw(a, k_i) + ",0,0,0",
             "$E",
@@ -958,7 +962,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.p_c2 = Plot("A", "time within one 50 Hz cycle  [ms]", 250)
         self.p_c2.legend()
         self.l_c0 = self.p_c2.line(C_BEFORE, 1.4, "before")
-        self.l_c = self.p_c2.line(C_AFTER, 2.4, "after (H1 only)")
+        self.l_c = self.p_c2.line(C_AFTER, 2.4, "after  (I + I_ahf)")
         self.p_c2.hover([(self.l_c0, "before", lambda y: "%.3f A" % y), (self.l_c, "after", lambda y: "%.3f A" % y)], ms)
         cc.body.addWidget(self.p_c2)
         for p in (self.p_a, self.p_c2):
@@ -1076,8 +1080,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self._frames_seen = s["frames"]
         w, m, pfc, ahf, k, r = s["wave"], s["m"], s["pfc"], s["ahf"], s["k"], s["r"]
 
+        f_hz = m["freq"] if 40.0 < m["freq"] < 70.0 else F_GRID   # old firmware sends no freq
+
         def xs(y):
-            return np.arange(y.size) * (1000.0 / F_GRID / y.size)
+            return np.arange(y.size) * (1000.0 / f_hz / y.size)
 
         yv, yi, ya, yt, yc = (w.get(n) for n in ("V", "I", "A", "T", "C"))
         hi = s["h"]["I"]
@@ -1094,7 +1100,7 @@ class Dashboard(QtWidgets.QMainWindow):
         if yi is not None and yi.size:
             self.l_i.setData(xs(yi), yi)
             self._yscale(self.p_i, "i", [yi], 0.05)
-        self.c_v.sub.setText("%.1f V rms  ·  THD %.1f %%" % (m["vrms"], m["thd_v"]))
+        self.c_v.sub.setText("%.1f V rms  ·  %.2f Hz  ·  THD %.1f %%" % (m["vrms"], f_hz, m["thd_v"]))
         self.c_i.sub.setText("%.3f A rms  ·  THD %.1f %%  ·  crest %.2f" % (m["irms"], m["thd_i"], m["crest"]))
 
         if self.tabs.currentIndex() == 0:
@@ -1170,7 +1176,8 @@ class Dashboard(QtWidgets.QMainWindow):
 
         _css(self.btn_act, _btn_style("#e3f6ef", C_AHF, C_GOOD, 2) if active else _btn_style(CARD, "#d6d9de", FG2))
         _css(self.btn_stb, _btn_style("#fdf4e2", C_WARN, C_WARN, 2) if not active else _btn_style(CARD, "#d6d9de", FG2))
-        self.ahf_sub.setText("ACTIVE" if active else "STANDBY")
+        self.ahf_sub.setText("ACTIVE  ·  loop residual %.1f %%  ·  duty pk %.0f %%"
+                             % (ahf["resid"], 100 * ahf["duty"]) if active else "STANDBY")
 
         # AHF vs target (normalised)
         def norm(y):
@@ -1225,12 +1232,12 @@ class Dashboard(QtWidgets.QMainWindow):
             "  A   %7.1f  %5d  %5d %5d\n"
             "ovr %d  drop %d  tx-skip %d  %s\n"
             "UART  cmd ok %d  bad %d  rx %d B\n"
-            "AHF   depth %.2f  adv %d"
+            "AHF   duty pk %.2f  residual %.1f %%"
             % (r["off_v"], r["min_v"], r["max_v"], r["clip_v"],
                r["off_i"], r["min_i"], r["max_i"], r["clip_i"],
                r["off_a"], r["min_a"], r["max_a"], r["clip_a"],
                r["adc_ovr"], r["win_drop"], r["tx_skip"], "CLIPPING!" if clip else "",
-               k["ok"], k["bad"], k["rx"], ahf["depth"], ahf["adv"]))
+               k["ok"], k["bad"], k["rx"], ahf["duty"], ahf["resid"]))
         _css(self.diag, "color:%s" % (C_BAD if clip else FG2))
 
 
