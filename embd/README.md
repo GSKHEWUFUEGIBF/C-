@@ -3,7 +3,7 @@
 Real-time light-theme dashboard for the STM32F401RE firmware.
 
 ```
-py -m pip install numpy pyserial pyqtgraph PySide6
+python -m pip install numpy pyserial pyqtgraph PySide6
 py dashboard.py --demo          # simulator, no hardware
 py dashboard.py                 # auto-detect ST-LINK / COM35
 py dashboard.py --port COM35

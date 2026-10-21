@@ -12,7 +12,7 @@ Two tabs share the grid voltage and grid current waveforms on top:
     py dashboard.py --demo          # built-in simulator, no hardware needed
 
 Requires: numpy, pyserial, pyqtgraph, PySide6
-          py -m pip install numpy pyserial pyqtgraph PySide6
+          python -m pip install numpy pyserial pyqtgraph PySide6
 
 Telemetry frames parsed: $W $M $H $P $A $K $R, committed atomically on $E.
 Commands sent:  $C,<idx>,<mode>,<on>   capacitor AUTO/MANUAL override
@@ -26,9 +26,13 @@ import sys
 import threading
 import time
 
-import numpy as np
-import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+try:
+    import numpy as np
+    import pyqtgraph as pg
+    from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+except ImportError as exc:
+    sys.exit("Missing library (%s). Install with:\n"
+             "    %s -m pip install numpy pyserial pyqtgraph PySide6" % (exc.name, sys.executable))
 
 try:
     import serial
