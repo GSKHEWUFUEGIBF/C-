@@ -4,7 +4,8 @@
  *             Stage 2: Active Harmonic Filter (TB6612FNG, 80 kHz PWM)
  *  Target   : STM32F401RE (NUCLEO-F401RE), pure CMSIS, zero HAL libraries
  *
- *  RELAY WIRING (5 V active-LOW modules on PB0 / PB1)
+ *  RELAY WIRING (5 V active-LOW modules on PB0 / PB1, SSR on PB2;
+ *  any pin can be switched to an SSR with RELAY_SSR_MASK)
  *    Module VCC -> Nucleo 5V, GND -> GND, IN -> PB0 / PB1 directly.
  *    PB0/PB1 are OPEN-DRAIN: the pin only ever sinks current (relay ON) or
  *    floats (relay OFF). When it floats, the module's own resistor pulls IN
@@ -110,7 +111,12 @@
 /* APFC Constants */
 #define PF_TARGET          0.95f
 #define C_DEADBAND_UF      1.25f
-#define CAP_RECLOSE_MS     3000u      /* capacitor discharge guard            */
+#define CAP_RECLOSE_MS     10000u     /* min OFF time before a cap re-closes.
+                                       * Only safe WITH a bleeder resistor on
+                                       * each cap (2.5uF 820k, 10uF 220k,
+                                       * 20uF 100k): without one a film cap
+                                       * holds its charge for minutes and the
+                                       * relay closes onto up to 650 V.       */
 #define APFC_V_MIN         10.0f
 #define APFC_P_MIN         0.5f
 #define PFC_SETTLE_WIN     2u
@@ -157,14 +163,14 @@ _Static_assert((uint64_t)(ADC_SMP_CYCLES + 12u) * N_CH * N_CYC * 53u < ADC_CLK_H
 /* ------------------------------------------------------------------------- */
 /*  Relay pins                                                               */
 /* ------------------------------------------------------------------------- */
-/* PB0, PB1: 5 V active-LOW modules, open-drain.  ON = sink LOW, OFF = float.
- * PB2     : SSR, active HIGH, push-pull.                                    */
-#define R1_ON    GPIO_BSRR_BR0
-#define R1_OFF   GPIO_BSRR_BS0
-#define R2_ON    GPIO_BSRR_BR1
-#define R2_OFF   GPIO_BSRR_BS1
-#define R3_ON    GPIO_BSRR_BS2
-#define R3_OFF   GPIO_BSRR_BR2
+/* PB0 = 2.5 uF, PB1 = 10 uF, PB2 = 20 uF. Each output is one of:
+ *   relay module : 5 V active-LOW, open-drain. ON = sink LOW, OFF = float.
+ *   SSR          : active-HIGH, push-pull.     ON = HIGH,     OFF = LOW.
+ * Bit i of RELAY_SSR_MASK set = PB<i> drives an SSR. Zero-cross SSRs are
+ * strongly recommended for capacitors: they close near 0 V, so a discharged
+ * cap draws almost no inrush (a mechanical relay closing near the 325 V peak
+ * sees hundreds of amps and its contacts weld).                            */
+#define RELAY_SSR_MASK     0x4u       /* PB2 = SSR, PB0/PB1 = relay modules   */
 
 /* ========================================================================= */
 /*  DSP core - no register access (built and simulated on a PC by           */
@@ -463,9 +469,10 @@ static void clock_init(void)
 
 static void relay_write(uint8_t st)
 {
-    GPIOB->BSRR = ((st & 1u) ? R1_ON : R1_OFF) |
-                  ((st & 2u) ? R2_ON : R2_OFF) |
-                  ((st & 4u) ? R3_ON : R3_OFF);
+    /* pin HIGH = SSR ON, or relay module OFF (released open-drain) */
+    const uint32_t hi = ((uint32_t)st & RELAY_SSR_MASK) |
+                        (~(uint32_t)st & ~RELAY_SSR_MASK & 7u);
+    GPIOB->BSRR = hi | ((~hi & 7u) << 16);
 }
 
 static void gpio_init(void)
@@ -490,8 +497,7 @@ static void gpio_init(void)
 
     /* Relays. Order matters: output type and OFF level are set while the pins
      * are still inputs, so they never drive LOW (= relay ON) even briefly.  */
-    GPIOB->OTYPER |=  (GPIO_OTYPER_OT0 | GPIO_OTYPER_OT1);   /* open-drain    */
-    GPIOB->OTYPER &= ~GPIO_OTYPER_OT2;                       /* SSR push-pull */
+    GPIOB->OTYPER  = (GPIOB->OTYPER & ~7u) | (~RELAY_SSR_MASK & 7u);  /* modules OD */
     GPIOB->PUPDR  &= ~((3u << (0 * 2)) | (3u << (1 * 2)) | (3u << (2 * 2)));
     relay_write(0);                                          /* all OFF       */
     relay_state  = 0;

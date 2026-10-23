@@ -45,7 +45,7 @@ except ImportError:  # demo mode still works
 # --------------------------------------------------------------------------- #
 F_GRID = 50.0
 CAP_UF = (2.5, 10.0, 20.0)
-CAP_RECLOSE_S = 3.0          # firmware CAP_RECLOSE_MS: discharge guard before a cap re-closes
+CAP_RECLOSE_S = 10.0         # firmware CAP_RECLOSE_MS: min OFF time before a cap re-closes
 N_H = 15
 M_KEYS = ("vrms", "irms", "p", "s", "q", "pf", "thd_v", "thd_i", "crest",
           "vpk", "ipk", "dpf", "dva", "freq")
