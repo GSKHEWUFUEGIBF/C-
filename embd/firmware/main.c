@@ -95,8 +95,13 @@
 
 /* Sensor Calibration */
 #define ADC_V_PER_LSB      (3.3f / 4095.0f)
-#define ACS712_V_PER_A     0.185f
-#define ACS_DIV            1.0f
+#define ACS712_V_PER_A     0.185f     /* 5 A module; 20 A = 0.100, 30 A = 0.066 */
+/* Resistor divider between an ACS712 OUT pin and its ADC pin:
+ * ratio = R_bottom / (R_top + R_bottom), 1.0f = wired directly.
+ * The ACS712 sits at 2.5 V for 0 A, but the ADC reads only up to 3.3 V, so
+ * without a divider positive current clips at about +4.3 A.             */
+#define ACS_DIV_I          0.6667f    /* sensor I (PA0): 10k series, 20k to GND */
+#define ACS_DIV_A          1.0f       /* sensor A (PA4, AHF): direct            */
 #define ZMPT_V_PER_V       1014.0f
 #define I_SIGN             1.0f
 #define V_SIGN             1.0f
@@ -112,8 +117,8 @@
                                        * gain/phase is divided back out per
                                        * harmonic, so the AHF loop is exact)  */
 
-#define K_I   (I_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV))
-#define K_A   (A_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV))
+#define K_I   (I_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV_I))
+#define K_A   (A_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV_A))
 #define K_V   (V_SIGN * ADC_V_PER_LSB * ZMPT_V_PER_V)
 
 /* APFC Constants */

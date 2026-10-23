@@ -29,6 +29,7 @@ Before flashing, set in `main.c`:
 
 | Setting | What to check |
 |---|---|
+| `ACS_DIV_I`, `ACS_DIV_A` | Divider ratio between each ACS712 OUT and its ADC pin (`R_bottom / (R_top + R_bottom)`, `1.0` if wired directly). Sensor I uses 10 kΩ + 20 kΩ = `0.6667`. |
 | `A_SIGN` | Sensor A must read +ve when the AHF pushes current in the direction sensor I reads +ve. If grid THD **rises** when AHF is ACTIVE, flip it. |
 | `AHF_SENSE_GRID` | `0` if sensor I sits on the load side of the injection point, `1` if it measures the already-compensated grid current. |
 | `AHF_INJ_RATIO` | Coupling-transformer ratio (PCC amps per sensor-A amp); `1` for direct injection. |
