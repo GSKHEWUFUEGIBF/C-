@@ -1,11 +1,30 @@
 #!/bin/sh
-# Builds the DSP core of ../main.c (everything from the first #define to
-# DSP-CORE-END: constants, then the register-free core) on the PC and runs
-# the AHF + PLL simulation.
+# Builds the register-free parts of ../main.c on the PC and runs:
+#   sim        - AHF selective-harmonic loop and grid PLL
+#   relay_sim  - capacitor relay timing rules and point-on-wave switching,
+#                for the current settings and for the previous firmware
 set -e
 cd "$(dirname "$0")"
 out=${TMPDIR:-/tmp}/ahf_sim_build
 mkdir -p "$out"
+CFLAGS="-std=c11 -O2 -Wall -Wextra -Wno-sign-compare -Wno-unused-function -Wno-unused-variable -Wno-type-limits"
+
+# constants + DSP core
 sed -n '/^#define SYSCLK_HZ/,/DSP-CORE-END/p' ../main.c > "$out/core.h"
-cc -std=c11 -O2 -Wall -Wextra -Wno-sign-compare -Wno-unused-function -I"$out" sim.c -lm -o "$out/sim"
+cc $CFLAGS -I"$out" sim.c -lm -o "$out/sim"
 "$out/sim"
+
+# relay functions, copied verbatim
+fn() { awk -v f="$1" '$0 ~ "^static .*[ *]" f "\\(" {p=1} p {print} p && /^}/ {exit}' ../main.c; }
+{ fn relay_bsrr; fn relay_isr_step; fn locks_read; fn relay_service; } > "$out/relay_fns.h"
+echo
+cc $CFLAGS -I"$out" relay_sim.c -lm -o "$out/relay_sim"
+"$out/relay_sim"
+
+# same scenario with the previous firmware's rules (immediate switching, 3 s, no min ON)
+sed -i -e 's/^\(#define RELAY_SYNC  *\)[0-9]*u/\10u/' \
+       -e 's/^\(#define RELAY_MIN_ON_MS  *\)[0-9]*u/\10u/' \
+       -e 's/^\(#define CAP_RECLOSE_MS  *\)[0-9]*u/\13000u/' "$out/core.h"
+echo; echo "=== previous firmware, same scenario ==="
+cc $CFLAGS -I"$out" relay_sim.c -lm -o "$out/relay_old"
+"$out/relay_old"

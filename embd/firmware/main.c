@@ -172,6 +172,32 @@ _Static_assert((uint64_t)(ADC_SMP_CYCLES + 12u) * N_CH * N_CYC * 53u < ADC_CLK_H
  * sees hundreds of amps and its contacts weld).                            */
 #define RELAY_SSR_MASK     0x4u       /* PB2 = SSR, PB0/PB1 = relay modules   */
 
+/* Switching rules for the capacitor steps (AUTO and manual alike)          */
+#define RELAY_MIN_ON_MS    10000u     /* a closed cap stays ON at least this  */
+/*  CAP_RECLOSE_MS (above) is the matching minimum OFF time.                 */
+
+/* Point-on-wave switching for relay modules (not SSRs). With no bleeder the
+ * cap keeps the voltage it was disconnected at.
+ *  Opening: the contacts part shortly before the +peak. A cap's current is
+ *    ~0 there, and if an arc does form it runs on to the current zero, which
+ *    is that same +peak - either way the cap is left near +Vpk.
+ *  Closing: at the +peak, so the contacts see ~0 V. A cap whose charge is
+ *    unknown (never opened by this firmware since boot) is closed at the
+ *    rising zero crossing instead: at most Vpk across the contacts whether
+ *    it is empty or charged either way (closing at the peak could be 2 Vpk).
+ * The PLL holds the voltage peak at sample k = 0 of every cycle.           */
+#define RELAY_SYNC         1u         /* 0 = switch immediately (old way)     */
+#define RELAY_T_OP_MS      7.0f       /* coil ON  -> contacts closed (typ 5-9)*/
+#define RELAY_T_REL_MS     5.0f       /* coil OFF -> contacts open   (typ 2-8)*/
+#define RELAY_OPEN_LEAD_MS 2.0f       /* contacts part this long before +peak */
+#define RELAY_MS_TO_K(ms)  ((uint32_t)((ms) * (float)FS_HZ / 1000.0f + 0.5f))
+#define RELAY_K_PEAK       ((uint32_t)((float)N_CYC - ZMPT_LAG_DEG / 360.0f * (float)N_CYC) % N_CYC)
+#define RELAY_K_ON         ((RELAY_K_PEAK + 2u * N_CYC - RELAY_MS_TO_K(RELAY_T_OP_MS)) % N_CYC)
+#define RELAY_K_ON_ZERO    ((RELAY_K_PEAK + 2u * N_CYC - N_CYC / 4u - \
+                             RELAY_MS_TO_K(RELAY_T_OP_MS)) % N_CYC)
+#define RELAY_K_OFF        ((RELAY_K_PEAK + 2u * N_CYC - RELAY_MS_TO_K(RELAY_OPEN_LEAD_MS) - \
+                             RELAY_MS_TO_K(RELAY_T_REL_MS)) % N_CYC)
+
 /* ========================================================================= */
 /*  DSP core - no register access (built and simulated on a PC by           */
 /*  firmware/test/run_sim.sh, which copies everything between the markers)   */
@@ -217,6 +243,7 @@ static float    pll_f_cmd = F_GRID_HZ;  /* sample clock = N_CYC * pll_f_cmd   */
 static float    pll_f_est = F_GRID_HZ;  /* measured grid frequency            */
 static float    pll_ph_prev;
 static uint32_t pll_have_prev;
+static uint32_t pll_locked;             /* window start sits on the V peak    */
 
 static void ahf_model_init(void)
 {
@@ -352,6 +379,7 @@ static void pll_update(float a1, float b1, bool valid)
 {
     if (!valid) {
         pll_have_prev = 0;
+        pll_locked    = 0;
         pll_f_cmd += 0.2f * (F_GRID_HZ - pll_f_cmd);
         return;
     }
@@ -364,7 +392,8 @@ static void pll_update(float a1, float b1, bool valid)
         float f = f_grid + PLL_KP_HZ * wrap_pi(ph - PLL_PHASE_SET);
         if (f < PLL_F_MIN) f = PLL_F_MIN;
         if (f > PLL_F_MAX) f = PLL_F_MAX;
-        pll_f_cmd = f;
+        pll_f_cmd  = f;
+        pll_locked = fabsf(wrap_pi(ph - PLL_PHASE_SET)) < 0.1f;     /* 0.3 ms */
     }
     pll_ph_prev   = ph;
     pll_have_prev = 1;
@@ -424,7 +453,10 @@ static volatile uint8_t  lock_mask = 0;
 static volatile uint8_t  lock_state = 0;
 static volatile bool     pfc_cmd_pending;
 static uint8_t           relay_state = 0, relay_target = 0;
-static uint32_t          relay_off_ms[3] = {0};
+static uint32_t          relay_off_ms[3] = {0}, relay_on_ms[3] = {0};
+static volatile uint8_t  relay_pend_on, relay_pend_on0, relay_pend_off;  /* TIM2 ISR */
+static uint8_t           relay_v_known;     /* cap left near +Vpk by a timed open */
+static bool              grid_v_present;
 static uint8_t           pfc_hold = 1;
 static float             pfc_c_need = 0.0f;
 
@@ -467,12 +499,37 @@ static void clock_init(void)
     SystemCoreClock = SYSCLK_HZ;
 }
 
-static void relay_write(uint8_t st)
+/* BSRR value that puts the relay pins in `bits` into state `st` */
+static uint32_t relay_bsrr(uint8_t bits, uint8_t st)
 {
     /* pin HIGH = SSR ON, or relay module OFF (released open-drain) */
-    const uint32_t hi = ((uint32_t)st & RELAY_SSR_MASK) |
-                        (~(uint32_t)st & ~RELAY_SSR_MASK & 7u);
-    GPIOB->BSRR = hi | ((~hi & 7u) << 16);
+    const uint32_t m  = (uint32_t)bits & 7u;
+    const uint32_t hi = (((uint32_t)st & RELAY_SSR_MASK) |
+                         (~(uint32_t)st & ~RELAY_SSR_MASK)) & m;
+    return hi | ((m & ~hi) << 16);
+}
+
+static void relay_write(uint8_t st)
+{
+    GPIOB->BSRR = relay_bsrr(7u, st);
+}
+
+/* Called by the TIM2 ISR for every sample; i = sample index in the cycle.
+ * Drives the coils that relay_service() scheduled for point-on-wave.     */
+static inline void relay_isr_step(uint32_t i)
+{
+    if (relay_pend_on && i == RELAY_K_ON) {           /* close at +peak       */
+        GPIOB->BSRR   = relay_bsrr(relay_pend_on, 7u);
+        relay_pend_on = 0u;
+    }
+    if (relay_pend_on0 && i == RELAY_K_ON_ZERO) {     /* close at zero cross  */
+        GPIOB->BSRR    = relay_bsrr(relay_pend_on0, 7u);
+        relay_pend_on0 = 0u;
+    }
+    if (relay_pend_off && i == RELAY_K_OFF) {
+        GPIOB->BSRR    = relay_bsrr(relay_pend_off, 0u);
+        relay_pend_off = 0u;
+    }
 }
 
 static void gpio_init(void)
@@ -644,6 +701,8 @@ void TIM2_IRQHandler(void)
     const uint32_t i = ahf_idx;
     if (i == 0u && ahf_swap) { ahf_sel ^= 1u; ahf_swap = 0u; ahf_swapped = 1u; }
     ahf_idx = (i + 1u < N_CYC) ? i + 1u : 0u;
+
+    relay_isr_step(i);
 
     if (!ahf_active) {
         TIM4->CCR1 = 0;
@@ -1049,19 +1108,38 @@ static void relay_service(uint32_t now)
 
     relay_target = (uint8_t)((relay_target & ~mask) | (lst & mask));
 
-    uint8_t st = relay_state;
+    /* With no mains voltage there is nothing to time against and nothing
+     * to protect: switch at once. Otherwise relay modules wait for the PLL. */
+    const bool sync = RELAY_SYNC && grid_v_present;
+    uint8_t st = relay_state, now_bits = 0, at_on = 0, at_on0 = 0, at_off = 0;
     for (uint32_t i = 0; i < 3u; i++) {
-        const uint8_t b = (uint8_t)(1u << i);
+        const uint8_t b    = (uint8_t)(1u << i);
+        const bool    timed = sync && !(RELAY_SSR_MASK & b);
         if ((relay_target & b) && !(st & b)) {
-            if ((now - relay_off_ms[i]) >= CAP_RECLOSE_MS) st |= b;
+            if ((now - relay_off_ms[i]) < CAP_RECLOSE_MS) continue;   /* min OFF  */
+            if (timed && !pll_locked) continue;           /* only at a known peak */
+            st |= b;
+            relay_on_ms[i] = now;
+            if (!timed)               now_bits |= b;
+            else if (relay_v_known & b) at_on    |= b;
+            else                        at_on0   |= b;
         } else if (!(relay_target & b) && (st & b)) {
+            if ((now - relay_on_ms[i]) < RELAY_MIN_ON_MS) continue;   /* min ON   */
             st &= (uint8_t)~b;
             relay_off_ms[i] = now;
+            if (timed && pll_locked) { at_off |= b; relay_v_known |= b; }
+            else { now_bits |= b; relay_v_known &= (uint8_t)~b; }
         }
     }
     if (st != relay_state) {
+        __disable_irq();
+        const uint8_t on_any = (uint8_t)(at_on | at_on0);
+        relay_pend_on  = (uint8_t)((relay_pend_on  & ~(now_bits | at_off | at_on0)) | at_on);
+        relay_pend_on0 = (uint8_t)((relay_pend_on0 & ~(now_bits | at_off | at_on))  | at_on0);
+        relay_pend_off = (uint8_t)((relay_pend_off & ~(now_bits | on_any)) | at_off);
+        if (now_bits) GPIOB->BSRR = relay_bsrr(now_bits, st);
+        __enable_irq();
         relay_state = st;
-        relay_write(st);
         acc_reset();
         settle_win = PFC_SETTLE_WIN;
     }
@@ -1172,6 +1250,7 @@ static void on_window(bool clean)
 {
     process_window(snap, &mw);
     pll_update(av[1], bv[1], mw.vrms > 0.0f);
+    grid_v_present = mw.vrms > 0.0f;
     pll_apply();
     ahf_step(clean);
 

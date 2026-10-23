@@ -34,6 +34,9 @@ Before flashing, set in `main.c`:
 | `AHF_INJ_RATIO` | Coupling-transformer ratio (PCC amps per sensor-A amp); `1` for direct injection. |
 | `AHF_VDC`, `AHF_L_H`, `AHF_R_OHM` | Only a starting guess; the loop measures the real values. |
 | `RELAY_SSR_MASK` | Bit set = that pin drives an active-HIGH SSR (default `0x4`: PB2). Clear = 5 V active-LOW relay module. |
-| `CAP_RECLOSE_MS` | 10 s minimum OFF time before a capacitor re-closes. Needs a **bleeder resistor across every capacitor** (2.5 µF 820 kΩ, 10 µF 220 kΩ, 20 µF 100 kΩ, 1 W, ≥400 V), otherwise the cap is still charged when the relay closes and the contacts weld. |
+| `RELAY_MIN_ON_MS`, `CAP_RECLOSE_MS` | 10 s minimum ON and OFF time for each capacitor. |
+| `RELAY_SYNC`, `RELAY_T_OP_MS`, `RELAY_T_REL_MS` | Relay modules open just before and close at the voltage peak, so a capacitor without a bleeder resistor is reconnected with ~0 V across the contacts. |
+
+Operating rules for the capacitor bank: [`CAPACITOR_RELAY_GUIDELINES.txt`](CAPACITOR_RELAY_GUIDELINES.txt).
 
 Simulation of the control maths on a PC (no hardware): `firmware/test/run_sim.sh`.

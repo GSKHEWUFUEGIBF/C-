@@ -1,0 +1,104 @@
+CAPACITOR BANK - OPERATING GUIDELINES
+(setup without bleeder resistors, 5 V relay modules on PB0/PB1, SSR on PB2)
+==========================================================================
+
+WHY RELAYS GET DAMAGED
+----------------------
+A capacitor that has been switched OFF stays charged (up to 325 V) for a
+long time - minutes to hours - because nothing discharges it. If the relay
+then closes at a bad moment, up to 650 V appears across its contacts for a
+few microseconds and hundreds of amps flow. That welds or burns the
+contacts. The relay's "10 A 240 V" rating does not cover this.
+
+The normal running current is small (10 uF = 0.72 A) and is NOT the problem.
+The danger is only the moment the relay CLOSES.
+
+
+WHAT THE FIRMWARE NOW DOES FOR YOU (automatic, AUTO and MANUAL mode)
+--------------------------------------------------------------------
+1. MINIMUM ON TIME = 10 s
+   Once a capacitor is switched ON it stays ON for at least 10 s, even if you
+   click OFF earlier. The dashboard button shows "-> OFF (wait)".
+
+2. MINIMUM OFF TIME = 10 s
+   Once a capacitor is switched OFF it cannot be switched ON again for 10 s.
+   The dashboard button shows "-> ON (wait)".
+   => each capacitor can close at most once every 20 s.
+
+3. SWITCHING AT THE RIGHT POINT OF THE MAINS WAVE (relay modules only)
+   - OFF: the relay opens just before the positive voltage peak, so the
+     capacitor is always left charged to about +325 V (a known value).
+   - ON : the relay closes exactly at the positive peak, when the mains is
+     also at +325 V, so the contacts see almost 0 V and almost no inrush.
+   - The first time after power-up (charge unknown) it closes at the zero
+     crossing, which limits the voltage across the contacts to 325 V.
+   - The firmware waits until it is locked to the mains (about 1 s after
+     power-up) before it closes any relay module.
+
+   Simulated result, clicking ON/OFF every second for 2 minutes:
+     old firmware : 30 closes, up to 650 V across the contacts
+     new firmware :  6 closes, about 0-60 V (up to ~190 V if the relay's
+                    real delay differs from the setting by 2 ms)
+
+
+RULES FOR THE OPERATOR
+----------------------
+DO
+  * Leave the bank in AUTO MODE for normal running. AUTO only switches when
+    the power factor really needs it and never chatters.
+  * In MANUAL mode, click a capacitor ON or OFF once and wait. Watch the
+    button text - "(wait)" means the firmware is holding it on purpose.
+  * Wait for the green "LIVE" status and a stable frequency (e.g. 50.0x Hz)
+    on the dashboard before using manual switching.
+  * Test the capacitor stage with a real inductive load (table fan, motor,
+    tube-light choke). A phone charger or other small electronic load does
+    not need capacitors - its low PF is from harmonics, not phase shift.
+
+DO NOT
+  * Do not click ON/OFF repeatedly to "see it work". Each close is wear.
+  * Do not reset or re-flash the Nucleo while capacitors are ON. A reset
+    releases the relays at a random moment and the firmware no longer knows
+    the capacitor's charge.
+  * Do not switch the mains supply on and off repeatedly with capacitors ON.
+  * Do not turn RELAY_SYNC off, or shorten RELAY_MIN_ON_MS / CAP_RECLOSE_MS.
+
+SAFETY
+  * The capacitors stay charged after everything is switched off - up to
+    325 V, possibly for hours. Do not touch the capacitor terminals or the
+    relay output terminals, even with the mains unplugged.
+  * Never discharge a capacitor by shorting it with a screwdriver or wire.
+    If you must handle one, discharge it through a resistor (a few kOhm,
+    5 W or more) held with insulated probes, and check with a meter.
+  * Only use AC film capacitors (motor-run / PFC type), rated 400 VAC or more.
+
+
+STOP AND CHECK THE RELAY IF
+---------------------------
+  * the relay LED is OFF but the capacitor still appears connected (the
+    dashboard's reactive power Q stays low or leading, as if it were ON) -
+    the contacts are probably welded;
+  * a relay buzzes, or clicks without its LED changing;
+  * you hear a loud crack when a capacitor switches ON.
+With the mains OFF, measure COM-NO with the coil not energised: about 0 Ohm
+means the contacts are welded - replace the relay.
+
+
+SETTINGS IN main.c (only change if you know the values)
+-------------------------------------------------------
+  RELAY_SSR_MASK      0x4   bit set = that pin drives an SSR (PB2 by default)
+  RELAY_MIN_ON_MS   10000   minimum ON time  [ms]
+  CAP_RECLOSE_MS    10000   minimum OFF time [ms]
+  RELAY_SYNC            1   point-on-wave switching for relay modules
+  RELAY_T_OP_MS       7.0   relay operate time: coil ON -> contacts closed
+  RELAY_T_REL_MS      5.0   relay release time: coil OFF -> contacts open
+                            (typical for SRD-05VDC modules; if you can
+                            measure your relay with an oscilloscope, enter
+                            the real values - closer values = less inrush)
+
+
+BEST LONG-TERM FIX (when parts are available)
+---------------------------------------------
+  * A bleeder resistor across each capacitor:
+      2.5 uF -> 820 kOhm,  10 uF -> 220 kOhm,  20 uF -> 100 kOhm  (1 W, >= 400 V)
+  * An NTC thermistor (e.g. 10D-9) in series with each capacitor, or
+  * zero-cross SSRs instead of relay modules (then set RELAY_SSR_MASK).

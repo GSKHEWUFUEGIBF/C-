@@ -46,6 +46,7 @@ except ImportError:  # demo mode still works
 F_GRID = 50.0
 CAP_UF = (2.5, 10.0, 20.0)
 CAP_RECLOSE_S = 10.0         # firmware CAP_RECLOSE_MS: min OFF time before a cap re-closes
+RELAY_MIN_ON_S = 10.0        # firmware RELAY_MIN_ON_MS: min ON time before a cap opens
 N_H = 15
 M_KEYS = ("vrms", "irms", "p", "s", "q", "pf", "thd_v", "thd_i", "crest",
           "vpk", "ipk", "dpf", "dva", "freq")
@@ -233,6 +234,7 @@ class DemoLink(threading.Thread):
         self.lock_mask = self.lock_state = 0
         self.relays = self.target = 0
         self.off_t = [-1e9] * 3
+        self.on_t = [-1e9] * 3
         self.ahf_on = 1
         self.ok = self.bad = self.rx = 0
         self.hold, self.c_need = 1, 0.0
@@ -350,7 +352,8 @@ class DemoLink(threading.Thread):
             b = 1 << idx
             if self.target & b and not self.relays & b and now - self.off_t[idx] >= CAP_RECLOSE_S:
                 self.relays |= b
-            elif not self.target & b and self.relays & b:
+                self.on_t[idx] = now
+            elif not self.target & b and self.relays & b and now - self.on_t[idx] >= RELAY_MIN_ON_S:
                 self.relays &= ~b
                 self.off_t[idx] = now
 
@@ -1132,7 +1135,7 @@ class Dashboard(QtWidgets.QMainWindow):
             on, locked, want = st >> j & 1, mask >> j & 1, tgt >> j & 1
             state = "ON" if on else "OFF"
             if want != on:
-                state += " → ON (guard)" if want else " → OFF"
+                state += " → ON (wait)" if want else " → OFF (wait)"
             b.setText("%g µF\n%s · %s" % (CAP_UF[j], "MAN" if locked else "AUTO", state))
             face, edge = ("#e7f6ee", "#9fd8bd") if on else (CARD, "#d6d9de")
             if locked:
@@ -1141,8 +1144,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.bank_sub.setText("%d of 3 on" % bin(st).count("1"))
         self.apfc_txt.setText("Controller: <b>%s</b>  ·  installed %.1f µF  ·  required %.2f µF<br>"
                               "Click a step to override it; click again to cycle MAN ON → MAN OFF → AUTO.<br>"
-                              "A capacitor that was just switched off waits %g s before it can close again."
-                              % ("HOLD" if int(pfc["hold"]) else "SWITCHING", pfc["cap"], pfc["c_need"], CAP_RECLOSE_S))
+                              "Safety timing: a capacitor stays ON at least %g s and OFF at least %g s; "
+                              "relays switch at the voltage peak."
+                              % ("HOLD" if int(pfc["hold"]) else "SWITCHING", pfc["cap"], pfc["c_need"],
+                                 RELAY_MIN_ON_S, CAP_RECLOSE_S))
 
         if self.hist:
             h = np.asarray(self.hist)
