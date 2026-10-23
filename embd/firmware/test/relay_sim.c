@@ -21,7 +21,8 @@ static volatile uint8_t lock_mask, lock_state;
 static uint8_t  relay_state, relay_target;
 static uint32_t relay_off_ms[3], relay_on_ms[3];
 static volatile uint8_t relay_pend_on, relay_pend_on0, relay_pend_off;
-static uint8_t relay_v_known;
+static uint8_t relay_v_known, relay_waiting;
+static uint32_t relay_wait_ms[3];
 static bool     grid_v_present = true;
 static uint32_t settle_win;
 static void acc_reset(void) {}
@@ -76,13 +77,13 @@ static void contacts(relay_t *r, long n)
 }
 
 /* user clicks manual ON/OFF for relay `idx` every `period_ms`, for `secs` */
-static relay_t run(int idx, double c_uf, double t_op, double t_rel, int period_ms, int secs, unsigned seed)
+static relay_t run_l(int idx, double c_uf, double t_op, double t_rel, int period_ms, int secs, unsigned seed, int locked)
 {
     relay_t r = { c_uf, t_op, t_rel, 1, 0, 0, 0, 0.0, 0, 0, 0 };
     memset(relay_off_ms, 0, sizeof relay_off_ms); memset(relay_on_ms, 0, sizeof relay_on_ms);
     relay_state = relay_target = 0; relay_pend_on = relay_pend_on0 = relay_pend_off = 0;
-    relay_v_known = 0;
-    pll_locked = 1;
+    relay_v_known = 0; relay_waiting = 0;
+    pll_locked = (uint32_t)locked;
     srand(seed);
     uint32_t next_click = 20000 + rand() % 20;              /* start after 20 s */
     int want = 0;
@@ -101,6 +102,11 @@ static relay_t run(int idx, double c_uf, double t_op, double t_rel, int period_m
         contacts(&r, n);
     }
     return r;
+}
+
+static relay_t run(int idx, double c_uf, double t_op, double t_rel, int period_ms, int secs, unsigned seed)
+{
+    return run_l(idx, c_uf, t_op, t_rel, period_ms, secs, seed, 1);
 }
 
 int main(void)
@@ -124,11 +130,15 @@ int main(void)
     printf("\n10 uF worst case over all relay delays: %.0f V across the contacts\n", worst10);
     if (RELAY_SYNC) {
         relay_t r = run(1, 10.0, RELAY_T_OP_MS, RELAY_T_REL_MS, 1000, 120, 7);
-        int ok1 = r.closes <= 7, ok2 = worst10 <= 200.0, ok3 = r.dv_max <= 20.0;
+        int ok1 = r.closes <= 13, ok2 = worst10 <= 200.0, ok3 = r.dv_max <= 20.0;
         printf("  %s  rapid clicking limited to %d closes in 120 s\n", ok1 ? "PASS" : "FAIL", r.closes);
         printf("  %s  10 uF never sees more than 200 V at closing (relay delays +-2 ms off)\n", ok2 ? "PASS" : "FAIL");
         printf("  %s  with the configured relay delays: %.0f V\n", ok3 ? "PASS" : "FAIL", r.dv_max);
-        fails = !ok1 + !ok2 + !ok3;
+        relay_t u = run_l(1, 10.0, RELAY_T_OP_MS, RELAY_T_REL_MS, 60000, 30, 7, 0);
+        int ok4 = u.closes >= 1;
+        printf("  %s  no grid lock: capacitor still closes after %u ms (%d close)\n",
+               ok4 ? "PASS" : "FAIL", (unsigned)RELAY_LOCK_WAIT_MS, u.closes);
+        fails = !ok1 + !ok2 + !ok3 + !ok4;
     }
     return fails;
 }

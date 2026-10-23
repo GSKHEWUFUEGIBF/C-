@@ -16,14 +16,14 @@ The danger is only the moment the relay CLOSES.
 
 WHAT THE FIRMWARE NOW DOES FOR YOU (automatic, AUTO and MANUAL mode)
 --------------------------------------------------------------------
-1. MINIMUM ON TIME = 10 s
-   Once a capacitor is switched ON it stays ON for at least 10 s, even if you
+1. MINIMUM ON TIME = 5 s
+   Once a capacitor is switched ON it stays ON for at least 5 s, even if you
    click OFF earlier. The dashboard button shows "-> OFF (wait)".
 
-2. MINIMUM OFF TIME = 10 s
-   Once a capacitor is switched OFF it cannot be switched ON again for 10 s.
+2. MINIMUM OFF TIME = 5 s
+   Once a capacitor is switched OFF it cannot be switched ON again for 5 s.
    The dashboard button shows "-> ON (wait)".
-   => each capacitor can close at most once every 20 s.
+   => each capacitor can close at most once every 10 s.
 
 3. SWITCHING AT THE RIGHT POINT OF THE MAINS WAVE (relay modules only)
    - OFF: the relay opens just before the positive voltage peak, so the
@@ -33,12 +33,28 @@ WHAT THE FIRMWARE NOW DOES FOR YOU (automatic, AUTO and MANUAL mode)
    - The first time after power-up (charge unknown) it closes at the zero
      crossing, which limits the voltage across the contacts to 325 V.
    - The firmware waits until it is locked to the mains (about 1 s after
-     power-up) before it closes any relay module.
+     power-up) before it closes a relay module. If there is still no lock
+     after 2 s it closes anyway, so a capacitor is never held off for good.
+     The dashboard shows "Grid lock: yes/no" in the Capacitor bank card.
 
    Simulated result, clicking ON/OFF every second for 2 minutes:
      old firmware : 30 closes, up to 650 V across the contacts
-     new firmware :  6 closes, about 0-60 V (up to ~190 V if the relay's
+     new firmware : 12 closes, about 0-60 V (up to ~190 V if the relay's
                     real delay differs from the setting by 2 ms)
+
+
+WHEN DOES AUTO SWITCH A CAPACITOR ON?
+-------------------------------------
+AUTO aims for PF 0.99 and switches a step in whenever that brings the power
+factor closer to it. The smallest step is 2.5 uF = about 41 var at 230 V,
+so a step only helps once the load needs more than half of that (1.25 uF,
+about 21 var). Below that, switching in would over-correct and make the PF
+worse, so the bank holds and the dashboard says why, e.g.
+   "load needs only 0.80 uF, less than half the smallest step".
+Typical: a 50 W fan at PF 0.7 needs ~2.5 uF -> the 2.5 uF step switches in.
+A phone charger needs ~0 uF (its low PF is harmonics) -> nothing switches.
+If an inductive load shows "leading" Q on the dashboard, the current or
+voltage sensor is wired the other way round: flip I_SIGN in main.c.
 
 
 RULES FOR THE OPERATOR
@@ -86,8 +102,10 @@ means the contacts are welded - replace the relay.
 SETTINGS IN main.c (only change if you know the values)
 -------------------------------------------------------
   RELAY_SSR_MASK      0x4   bit set = that pin drives an SSR (PB2 by default)
-  RELAY_MIN_ON_MS   10000   minimum ON time  [ms]
-  CAP_RECLOSE_MS    10000   minimum OFF time [ms]
+  PF_TARGET          0.99   power factor AUTO aims for
+  RELAY_MIN_ON_MS    5000   minimum ON time  [ms]
+  CAP_RECLOSE_MS     5000   minimum OFF time [ms]
+  RELAY_LOCK_WAIT_MS 2000   close anyway if no grid lock after this [ms]
   RELAY_SYNC            1   point-on-wave switching for relay modules
   RELAY_T_OP_MS       7.0   relay operate time: coil ON -> contacts closed
   RELAY_T_REL_MS      5.0   relay release time: coil OFF -> contacts open

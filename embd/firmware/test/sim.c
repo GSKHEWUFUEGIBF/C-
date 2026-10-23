@@ -174,6 +174,40 @@ int main(void)
               "grid %.2f Hz -> measured %.3f Hz, phase error %.1f deg", fg[t], pll_f_est, ph_last * 57.3);
     }
 
+    printf("\nSensor A Butterworth low-pass (%.0f Hz)\n", (double)A_LPF_HZ);
+    {   /* filter a harmonic-rich signal sample by sample, fold, DFT, undo H */
+        cpx_t src[MAX_H + 1] = { { 0, 0 } };
+        for (unsigned h = 1; h <= MAX_H; h += 2) src[h] = c_mk((float)(1.0 / h), (float)(0.3 / h));
+        float one[N_CYC], fold[N_CYC] = { 0 }, a[MAX_H + 1], b[MAX_H + 1];
+        synth(src, one, 0.0);
+        float z1 = 0, z2 = 0;
+        for (unsigned n = 0; n < 40 * N_CYC; n++) {            /* settle, then keep last 5 cycles */
+            float x = one[n % N_CYC], y = a_lpf.b0 * x + z1;
+            z1 = a_lpf.b1 * x - a_lpf.a1 * y + z2;
+            z2 = a_lpf.b2 * x - a_lpf.a2 * y;
+            if (n >= 35 * N_CYC) fold[n % N_CYC] += y / CYC_PER_WIN;
+        }
+        dft(fold, a, b);
+        double err = 0, att15 = sqrt(c_abs2(a_lpf_h[15]));
+        for (unsigned h = 1; h <= MAX_H; h += 2) {
+            cpx_t x = c_div(c_phasor(a[h], b[h]), a_lpf_h[h]);
+            err = fmax(err, sqrt(c_abs2(c_sub(x, src[h])) / c_abs2(src[h])));
+        }
+        CHECK(err < 1e-3, "filter undone per harmonic: worst error %.4f %% (h15 gain %.2f, %.0f deg)",
+              100 * err, att15, atan2(a_lpf_h[15].im, a_lpf_h[15].re) * 57.3);
+        float noise[N_CYC] = { 0 };
+        z1 = z2 = 0;
+        double in2 = 0, out2 = 0;
+        for (unsigned n = 0; n < 200000; n++) {
+            float x = (float)gauss(), y = a_lpf.b0 * x + z1;
+            z1 = a_lpf.b1 * x - a_lpf.a1 * y + z2;
+            z2 = a_lpf.b2 * x - a_lpf.a2 * y;
+            in2 += x * x; out2 += y * y;
+        }
+        (void)noise;
+        CHECK(out2 / in2 < 0.4, "white sensor noise reduced to %.0f %% rms", 100 * sqrt(out2 / in2));
+    }
+
     printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
     return fails != 0;
 }

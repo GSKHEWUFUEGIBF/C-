@@ -42,6 +42,8 @@
  *  Telemetry changes (backwards compatible, fields appended / reused)
  *    $M  ... ,freq                 measured grid frequency [Hz]
  *    $A  active,apk,ref_pk,duty_pk,resid_pct
+ *    $P  ... ,lock,reason,wait_lock      grid lock, why the bank holds,
+ *                                        caps waiting for the lock
  *    $W,C                          I + A (measured), was an ideal sine
  * ========================================================================== */
 
@@ -103,20 +105,24 @@
 
 #define V_DEADBAND         5.0f
 #define I_DEADBAND         0.03f
+#define A_DEADBAND         0.05f      /* sensor A rms below this is shown as 0 */
+#define A_LPF_HZ           1000.0f    /* 2nd-order Butterworth low-pass on
+                                       * sensor A (h15 = 750 Hz passes; its
+                                       * gain/phase is divided back out per
+                                       * harmonic, so the AHF loop is exact)  */
 
 #define K_I   (I_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV))
 #define K_A   (A_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV))
 #define K_V   (V_SIGN * ADC_V_PER_LSB * ZMPT_V_PER_V)
 
 /* APFC Constants */
-#define PF_TARGET          0.95f
-#define C_DEADBAND_UF      1.25f
-#define CAP_RECLOSE_MS     10000u     /* min OFF time before a cap re-closes.
-                                       * Only safe WITH a bleeder resistor on
-                                       * each cap (2.5uF 820k, 10uF 220k,
-                                       * 20uF 100k): without one a film cap
-                                       * holds its charge for minutes and the
-                                       * relay closes onto up to 650 V.       */
+#define PF_TARGET          0.99f      /* switch whenever a step improves PF   */
+#define C_DEADBAND_UF      0.75f
+#define CAP_RECLOSE_MS     5000u      /* min OFF time before a cap re-closes.
+                                       * Without bleeder resistors the cap is
+                                       * still charged after this; the
+                                       * point-on-wave closing (RELAY_SYNC)
+                                       * is what protects the contacts.       */
 #define APFC_V_MIN         10.0f
 #define APFC_P_MIN         0.5f
 #define PFC_SETTLE_WIN     2u
@@ -173,7 +179,8 @@ _Static_assert((uint64_t)(ADC_SMP_CYCLES + 12u) * N_CH * N_CYC * 53u < ADC_CLK_H
 #define RELAY_SSR_MASK     0x4u       /* PB2 = SSR, PB0/PB1 = relay modules   */
 
 /* Switching rules for the capacitor steps (AUTO and manual alike)          */
-#define RELAY_MIN_ON_MS    10000u     /* a closed cap stays ON at least this  */
+#define RELAY_MIN_ON_MS    5000u      /* a closed cap stays ON at least this  */
+#define RELAY_LOCK_WAIT_MS 2000u      /* no grid lock after this: close anyway */
 /*  CAP_RECLOSE_MS (above) is the matching minimum OFF time.                 */
 
 /* Point-on-wave switching for relay modules (not SSRs). With no bleeder the
@@ -232,6 +239,10 @@ static float wrap_pi(float x)
 static float cos_t[N_CYC], sin_t[N_CYC];
 static float tan_phi_tgt;
 
+typedef struct { float b0, b1, b2, a1, a2; } biquad_t;
+static biquad_t a_lpf;                  /* sensor A low-pass                  */
+static cpx_t    a_lpf_h[MAX_H + 1];     /* its response at each harmonic      */
+
 static int16_t ahf_tab[2][N_CYC];       /* Q15 duty, one cycle, played by ISR */
 static cpx_t   ahf_tab_u[2][MAX_H + 1]; /* duty phasors that built each table */
 static cpx_t   ahf_u[MAX_H + 1];        /* duty phasor per harmonic (state)   */
@@ -255,6 +266,30 @@ static void ahf_model_init(void)
     }
 }
 
+/* 2nd-order Butterworth low-pass (bilinear, pre-warped) and its exact
+ * response at every harmonic. The sample clock is locked to 200 samples per
+ * cycle, so harmonic h is always at 2*pi*h/200 rad/sample.                 */
+static void lpf_init(void)
+{
+    const float k = tanf(3.14159265f * A_LPF_HZ / (float)FS_HZ);
+    const float n = 1.0f / (1.0f + 1.41421356f * k + k * k);
+    a_lpf.b0 = k * k * n;
+    a_lpf.b1 = 2.0f * a_lpf.b0;
+    a_lpf.b2 = a_lpf.b0;
+    a_lpf.a1 = 2.0f * (k * k - 1.0f) * n;
+    a_lpf.a2 = (1.0f - 1.41421356f * k + k * k) * n;
+    for (uint32_t h = 0; h <= MAX_H; h++) {
+        const float w  = TWO_PI * (float)h / (float)N_CYC;
+        const cpx_t z1 = c_mk(cosf(w), -sinf(w));            /* z^-1 */
+        const cpx_t z2 = c_mul(z1, z1);
+        const cpx_t num = c_add(c_mk(a_lpf.b0, 0.0f),
+                                c_add(c_scale(z1, a_lpf.b1), c_scale(z2, a_lpf.b2)));
+        const cpx_t den = c_add(c_mk(1.0f, 0.0f),
+                                c_add(c_scale(z1, a_lpf.a1), c_scale(z2, a_lpf.a2)));
+        a_lpf_h[h] = c_div(num, den);
+    }
+}
+
 static void tables_init(void)
 {
     for (uint32_t k = 0; k < N_CYC; k++) {
@@ -265,6 +300,7 @@ static void tables_init(void)
     tan_phi_tgt = sqrtf(1.0f - PF_TARGET * PF_TARGET) / PF_TARGET;
     memset(ahf_tab, 0, sizeof ahf_tab);
     ahf_model_init();
+    lpf_init();
 }
 
 static void dft(const float *x, float *a, float *b)
@@ -393,7 +429,7 @@ static void pll_update(float a1, float b1, bool valid)
         if (f < PLL_F_MIN) f = PLL_F_MIN;
         if (f > PLL_F_MAX) f = PLL_F_MAX;
         pll_f_cmd  = f;
-        pll_locked = fabsf(wrap_pi(ph - PLL_PHASE_SET)) < 0.1f;     /* 0.3 ms */
+        pll_locked = fabsf(wrap_pi(ph - PLL_PHASE_SET)) < 0.35f;    /* ~1 ms  */
     }
     pll_ph_prev   = ph;
     pll_have_prev = 1;
@@ -459,6 +495,12 @@ static uint8_t           relay_v_known;     /* cap left near +Vpk by a timed ope
 static bool              grid_v_present;
 static uint8_t           pfc_hold = 1;
 static float             pfc_c_need = 0.0f;
+static uint8_t           pfc_reason;        /* 0 ok, 1 no load, 2 load below the
+                                             * smallest step, 3 all manual     */
+static uint8_t           relay_waiting;     /* close held back: no grid lock   */
+static uint32_t          relay_wait_ms[3];
+static float             lpf_z1, lpf_z2;    /* sensor A filter state           */
+static bool              lpf_primed;
 
 static char              tx_buf[TX_BUF_SZ];
 static char             *tx_p;
@@ -753,6 +795,7 @@ static void sampling_sync_start(void)
     TIM2->SR   = 0;
     tim2_acc   = 0;
     ahf_idx    = 0;                   /* table index == sample index mod 200 */
+    lpf_primed = false;
     ahf_swapped = 0;
     win_ready  = -1;
 
@@ -895,9 +938,17 @@ void USART2_IRQHandler(void)
 static void process_window(const uint16_t *s, win_t *m)
 {
     static uint32_t csum[N_CH][N_CYC];
+    static float    csa[N_CYC];             /* sensor A after the low-pass    */
     uint32_t sum[N_CH] = { 0 };
 
     memset(csum, 0, sizeof csum);
+    memset(csa, 0, sizeof csa);
+    if (!lpf_primed) {                      /* start in steady state: no step */
+        const float x0 = (float)s[SLOT_A];
+        lpf_z2 = (a_lpf.b2 - a_lpf.a2) * x0;
+        lpf_z1 = (a_lpf.b1 - a_lpf.a1) * x0 + lpf_z2;
+        lpf_primed = true;
+    }
     for (uint32_t c = 0; c < N_CH; c++) { m->mn[c] = 0xFFFFu; m->mx[c] = 0; m->clip[c] = 0; }
 
     for (uint32_t n = 0, k = 0; n < N_WIN; n++) {
@@ -910,6 +961,11 @@ static void process_window(const uint16_t *s, win_t *m)
             if (r > m->mx[c]) m->mx[c] = r;
             if (r <= ADC_CLIP_LO || r >= ADC_CLIP_HI) m->clip[c]++;
         }
+        const float xa = (float)x[SLOT_A];                  /* Butterworth, DF2T */
+        const float ya = a_lpf.b0 * xa + lpf_z1;
+        lpf_z1 = a_lpf.b1 * xa - a_lpf.a1 * ya + lpf_z2;
+        lpf_z2 = a_lpf.b2 * xa - a_lpf.a2 * ya;
+        csa[k] += ya;
         if (++k == N_CYC) k = 0;
     }
     for (uint32_t c = 0; c < N_CH; c++) m->off[c] = (float)sum[c] / (float)N_WIN;
@@ -945,18 +1001,30 @@ static void process_window(const uint16_t *s, win_t *m)
     for (uint32_t k = 0; k < N_CYC; k++) {
         w_i[k] = (m->irms > 0.0f) ? (((float)csum[SLOT_I][k] * inv - oi) * K_I) : 0.0f;
         w_v[k] = (m->vrms > 0.0f) ? (((float)csum[SLOT_V][k] * inv - ov) * K_V) : 0.0f;
-        w_a[k] = ((float)csum[SLOT_A][k] * inv - oa) * K_A;
+        w_a[k] = (csa[k] * inv - oa) * K_A;
         if (fabsf(w_a[k]) > apk) apk = fabsf(w_a[k]);
     }
-    m->apk = apk;
 
     dft(w_i, ai, bi);
     dft(w_v, av, bv);
     dft(w_a, aa, ba);
+    for (uint32_t h = 1; h <= MAX_H; h++) {     /* undo the filter per harmonic */
+        const cpx_t x = c_div(c_phasor(aa[h], ba[h]), a_lpf_h[h]);
+        aa[h] = x.re;
+        ba[h] = -x.im;
+    }
+
+    /* Noise floor: below A_DEADBAND sensor A is shown as 0 (telemetry only;
+     * the AHF loop still uses the real values in aa/ba).                   */
+    float a2 = 0.0f;
+    for (uint32_t k = 0; k < N_CYC; k++) a2 += w_a[k] * w_a[k];
+    const bool a_on = sqrtf(a2 / (float)N_CYC) >= A_DEADBAND;
+    if (!a_on) { memset(w_a, 0, sizeof w_a); apk = 0.0f; }
+    m->apk = apk;
     float hv[MAX_H + 1];
     for (uint32_t h = 1; h <= MAX_H; h++) {
         m->h_i[h] = 0.70710678f * sqrtf(ai[h] * ai[h] + bi[h] * bi[h]);
-        m->h_a[h] = 0.70710678f * sqrtf(aa[h] * aa[h] + ba[h] * ba[h]);
+        m->h_a[h] = a_on ? 0.70710678f * sqrtf(aa[h] * aa[h] + ba[h] * ba[h]) : 0.0f;
         hv[h]     = 0.70710678f * sqrtf(av[h] * av[h] + bv[h] * bv[h]);
     }
     m->h_i[0] = m->h_a[0] = 0.0f;
@@ -982,12 +1050,22 @@ static void process_window(const uint16_t *s, win_t *m)
     for (uint32_t k = 0; k < N_CYC; k++) {
         float i_fund = ai[1] * cos_t[k] + bi[1] * sin_t[k];
         w_t[k] = -(w_i[k] - i_fund);
-#if AHF_SENSE_GRID
-        w_c[k] = w_i[k];                                   /* already the grid */
-#else
-        w_c[k] = w_i[k] + AHF_INJ_RATIO * w_a[k];          /* load + injection */
-#endif
+        w_c[k] = w_i[k];
     }
+#if !AHF_SENSE_GRID
+    /* load + injection; the injection is rebuilt from its filter-corrected
+     * harmonics so it lines up in time with the unfiltered sensor I        */
+    if (a_on) {
+        for (uint32_t h = 1; h <= MAX_H; h++) {
+            uint32_t idx = 0;
+            for (uint32_t k = 0; k < N_CYC; k++) {
+                w_c[k] += AHF_INJ_RATIO * (aa[h] * cos_t[idx] + ba[h] * sin_t[idx]);
+                idx += h;
+                if (idx >= N_CYC) idx -= N_CYC;
+            }
+        }
+    }
+#endif
 }
 
 /* clean: the AHF table did not change during this window, so sensor A shows
@@ -1070,6 +1148,7 @@ static void apfc_step(const avg_t *a)
         relay_target = lst;
         pfc_hold = 1;
         pfc_c_need = cap_sum(lst);
+        pfc_reason = 3u;
         return;
     }
 
@@ -1099,6 +1178,10 @@ static void apfc_step(const avg_t *a)
 
     if (best != cur && e_cur > C_DEADBAND_UF) { relay_target = (uint8_t)((best & ~mask) | (lst & mask)); pfc_hold = 0; }
     else                                      { relay_target = cur;  pfc_hold = 1; }
+
+    if (a->vrms < APFC_V_MIN || fabsf(a->p1) < APFC_P_MIN) pfc_reason = 1u;
+    else if (pfc_hold && cur == 0u && c_need > 0.0f)       pfc_reason = 2u;
+    else                                                   pfc_reason = 0u;
 }
 
 static void relay_service(uint32_t now)
@@ -1112,17 +1195,24 @@ static void relay_service(uint32_t now)
      * to protect: switch at once. Otherwise relay modules wait for the PLL. */
     const bool sync = RELAY_SYNC && grid_v_present;
     uint8_t st = relay_state, now_bits = 0, at_on = 0, at_on0 = 0, at_off = 0;
+    relay_waiting &= (uint8_t)(relay_target & ~st);
     for (uint32_t i = 0; i < 3u; i++) {
         const uint8_t b    = (uint8_t)(1u << i);
         const bool    timed = sync && !(RELAY_SSR_MASK & b);
         if ((relay_target & b) && !(st & b)) {
             if ((now - relay_off_ms[i]) < CAP_RECLOSE_MS) continue;   /* min OFF  */
-            if (timed && !pll_locked) continue;           /* only at a known peak */
+            bool at_wave = timed;
+            if (timed && !pll_locked) {           /* wait for the peak timing ...  */
+                if (!(relay_waiting & b)) { relay_waiting |= b; relay_wait_ms[i] = now; }
+                if ((now - relay_wait_ms[i]) < RELAY_LOCK_WAIT_MS) continue;
+                at_wave = false;                  /* ... but not forever          */
+            }
+            relay_waiting &= (uint8_t)~b;
             st |= b;
             relay_on_ms[i] = now;
-            if (!timed)               now_bits |= b;
-            else if (relay_v_known & b) at_on    |= b;
-            else                        at_on0   |= b;
+            if (!at_wave) { now_bits |= b; relay_v_known &= (uint8_t)~b; }
+            else if (relay_v_known & b) at_on  |= b;
+            else                        at_on0 |= b;
         } else if (!(relay_target & b) && (st & b)) {
             if ((now - relay_on_ms[i]) < RELAY_MIN_ON_MS) continue;   /* min ON   */
             st &= (uint8_t)~b;
@@ -1208,7 +1298,8 @@ static void telemetry_send(const win_t *m, const avg_t *a)
     uint8_t mask, lst;
     locks_read(&mask, &lst);
     tx_s("$P"); tx_cu(relay_state); tx_cf(cap_sum(relay_state), 1); tx_cf(a->pf, 4);
-    tx_cf(a->q1, 2); tx_cu(pfc_hold); tx_cu(relay_target); tx_cf(pfc_c_need, 2); tx_c('\n');
+    tx_cf(a->q1, 2); tx_cu(pfc_hold); tx_cu(relay_target); tx_cf(pfc_c_need, 2);
+    tx_cu(pll_locked); tx_cu(pfc_reason); tx_cu(relay_waiting); tx_c('\n');
 
     tx_s("$A"); tx_cu(ahf_active); tx_cf(m->apk, 4); tx_cf(ahf_ref_pk_f, 4);
     tx_cf(ahf_duty_pk, 3); tx_cf(ahf_resid_pct, 1); tx_c('\n');

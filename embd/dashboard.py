@@ -45,12 +45,15 @@ except ImportError:  # demo mode still works
 # --------------------------------------------------------------------------- #
 F_GRID = 50.0
 CAP_UF = (2.5, 10.0, 20.0)
-CAP_RECLOSE_S = 10.0         # firmware CAP_RECLOSE_MS: min OFF time before a cap re-closes
-RELAY_MIN_ON_S = 10.0        # firmware RELAY_MIN_ON_MS: min ON time before a cap opens
+CAP_RECLOSE_S = 5.0          # firmware CAP_RECLOSE_MS: min OFF time before a cap re-closes
+RELAY_MIN_ON_S = 5.0         # firmware RELAY_MIN_ON_MS: min ON time before a cap opens
+PF_TARGET = 0.99             # firmware PF_TARGET
+N_SHOW = 2                   # cycles shown in the waveform plots (the averaged cycle, repeated)
+I1_MIN = 0.02                # A rms: below this a current's THD is meaningless
 N_H = 15
 M_KEYS = ("vrms", "irms", "p", "s", "q", "pf", "thd_v", "thd_i", "crest",
           "vpk", "ipk", "dpf", "dva", "freq")
-P_KEYS = ("state", "cap", "pf", "q", "hold", "target", "c_need")
+P_KEYS = ("state", "cap", "pf", "q", "hold", "target", "c_need", "lock", "why", "wlock")
 A_KEYS = ("active", "peak", "ref_peak", "duty", "resid")   # duty: table peak, resid: loop error %
 K_KEYS = ("mask", "state", "ok", "bad", "rx")
 R_KEYS = ("off_v", "min_v", "max_v", "clip_v", "off_i", "min_i", "max_i", "clip_i",
@@ -328,6 +331,8 @@ class DemoLink(threading.Thread):
         else:
             a, duty = np.zeros(n), 0.0
         a = a + rng.normal(0, 0.006, n)
+        if math.sqrt(np.mean(a * a)) < 0.05:          # firmware A_DEADBAND
+            a = np.zeros(n)
         aa, ba = self._dft(a)
         ha = np.hypot(aa, ba) / math.sqrt(2)
         resid = 100.0 * math.sqrt(np.sum(np.hypot(ai[1:] + aa[1:], bi[1:] + ba[1:]) ** 2)
@@ -338,16 +343,18 @@ class DemoLink(threading.Thread):
         k_var = w * vrms * vrms * 1e-6
         cur = (self.target & ~self.lock_mask) | (self.lock_state & self.lock_mask)
         q_load = q1 + k_var * self._cap(self.relays)
-        self.c_need = max((q_load - abs(p1) * math.sqrt(1 - 0.95 ** 2) / 0.95) / k_var, 0.0)
+        self.c_need = max((q_load - abs(p1) * math.sqrt(1 - PF_TARGET ** 2) / PF_TARGET) / k_var, 0.0)
         if self.lock_mask == 7:     # all manual: firmware reports the locked bank as "required"
             self.c_need = self._cap(self.lock_state)
         combos = [st for st in range(8) if (st & self.lock_mask) == (self.lock_state & self.lock_mask)]
         best = min(combos, key=lambda st: (abs(self._cap(st) - self.c_need), bin(st ^ cur).count("1")))
         e_cur = abs(self._cap(cur) - self.c_need)
-        if best != cur and e_cur > 1.25 and abs(self._cap(best) - self.c_need) < e_cur:
+        if best != cur and e_cur > 0.75 and abs(self._cap(best) - self.c_need) < e_cur:
             self.target, self.hold = best, 0
         else:
             self.target, self.hold = cur, 1
+        self.why = (3 if self.lock_mask == 7 else 1 if abs(p1) < 0.5
+                    else 2 if self.hold and cur == 0 and self.c_need > 0 else 0)
         for idx in range(3):
             b = 1 << idx
             if self.target & b and not self.relays & b and now - self.off_t[idx] >= CAP_RECLOSE_S:
@@ -375,8 +382,8 @@ class DemoLink(threading.Thread):
                                                   F_GRID + 0.03 * math.sin(t / 20))),
             "$H,I," + ",".join("%.4f" % x for x in hi),
             "$H,A," + ",".join("%.4f" % x for x in ha),
-            "$P,%d,%.1f,%.4f,%.2f,%d,%d,%.2f" % (self.relays, self._cap(self.relays), pf, q1,
-                                                 self.hold, self.target, self.c_need),
+            "$P,%d,%.1f,%.4f,%.2f,%d,%d,%.2f,1,%d,0" % (self.relays, self._cap(self.relays), pf, q1,
+                                                       self.hold, self.target, self.c_need, self.why),
             "$A,%d,%.4f,%.4f,%.3f,%.1f" % (self.ahf_on, np.max(np.abs(a)), pk, duty,
                                             resid if self.ahf_on else 0.0),
             "$K,%d,%d,%d,%d,%d" % (self.lock_mask, self.lock_state, self.ok, self.bad, self.rx),
@@ -407,8 +414,13 @@ def _spectrum(y):
     return out
 
 
+def cyc(y):
+    """The firmware's averaged cycle, repeated N_SHOW times for display."""
+    return np.tile(y, N_SHOW)
+
+
 def _thd(h):
-    return 100.0 * math.sqrt(float(np.sum(h[1:] ** 2))) / h[0] if h[0] > 1e-9 else float("nan")
+    return 100.0 * math.sqrt(float(np.sum(h[1:] ** 2))) / h[0] if h[0] > I1_MIN else float("nan")
 
 
 # =========================================================================== #
@@ -573,8 +585,8 @@ class PFGauge(QtWidgets.QWidget):
                 rl = r1 - 13
                 p.drawText(QtCore.QRectF(cx + rl * math.cos(a) - 16, cy - rl * math.sin(a) - 8, 32, 16),
                            QtCore.Qt.AlignmentFlag.AlignCenter, "%.1f" % v)
-        # 0.95 target tick
-        a = math.pi * 0.05
+        # PF target tick
+        a = math.pi * (1 - PF_TARGET)
         pen = QtGui.QPen(QtGui.QColor(FG), 1.4, QtCore.Qt.PenStyle.DotLine)
         p.setPen(pen)
         p.drawLine(QtCore.QPointF(cx + (r - thick) * math.cos(a), cy - (r - thick) * math.sin(a)),
@@ -823,19 +835,23 @@ class Dashboard(QtWidgets.QMainWindow):
     def _build_common(self):
         ms = lambda x: "t = %.2f ms" % x
         self.c_v = Card("Grid voltage  V(t)", "")
-        self.p_v = Plot("V", "time within one 50 Hz cycle  [ms]", 250)
+        self.p_v = Plot("V", "time  [ms]  ·  %d cycles" % N_SHOW, 230)
         self.l_v = self.p_v.line(C_V, 2.2)
         self.p_v.hover([(self.l_v, "V", lambda y: "%.1f V" % y)], ms)
         self.c_v.body.addWidget(self.p_v)
 
         self.c_i = Card("Grid current  I(t)", "")
-        self.p_i = Plot("A", "time within one 50 Hz cycle  [ms]", 250)
+        self.p_i = Plot("A", "time  [ms]  ·  %d cycles" % N_SHOW, 230)
         self.l_i = self.p_i.line(C_I, 2.2)
         self.p_i.hover([(self.l_i, "I", lambda y: "%.3f A" % y)], ms)
         self.c_i.body.addWidget(self.p_i)
         for p in (self.p_v, self.p_i):
-            p.setXRange(0, 1000.0 / F_GRID, padding=0.01)
-        return _row(self.c_v, self.c_i)
+            p.setXRange(0, N_SHOW * 1000.0 / F_GRID, padding=0.01)
+        lay = QtWidgets.QVBoxLayout()           # full-width, one above the other
+        lay.setSpacing(14)
+        lay.addWidget(self.c_v)
+        lay.addWidget(self.c_i)
+        return lay
 
     def _build_pfc(self):
         w = QtWidgets.QWidget()
@@ -844,7 +860,7 @@ class Dashboard(QtWidgets.QMainWindow):
         lay.setSpacing(14)
 
         # gauge
-        gcard = Card("Power factor", "target 0.95")
+        gcard = Card("Power factor", "target %.2f" % PF_TARGET)
         self.gauge = PFGauge()
         gcard.body.addWidget(self.gauge, 1)
         leg = QtWidgets.QLabel('<span style="color:%s">▼</span> DPF (displacement) &nbsp;&nbsp; '
@@ -897,7 +913,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.p_pf.legend()
         self.l_pf = self.p_pf.line(C_PF, 2.0, "PF")
         self.l_dpf = self.p_pf.line(C_DPF, 1.6, "DPF")
-        self.p_pf.addItem(pg.InfiniteLine(0.95, angle=0, pen=pg.mkPen(C_BAD, width=1.2,
+        self.p_pf.addItem(pg.InfiniteLine(PF_TARGET, angle=0, pen=pg.mkPen(C_BAD, width=1.2,
                                                                     style=QtCore.Qt.PenStyle.DashLine)))
         self.p_pf.hover([(self.l_pf, "PF", lambda y: "%.3f" % y), (self.l_dpf, "DPF", lambda y: "%.3f" % y)], sec)
         tc.body.addWidget(self.p_pf)
@@ -906,7 +922,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.p_c = Plot("µF", "seconds", 240)
         self.p_c.legend()
         self.l_cap = self.p_c.line(C_AFTER, 2.2, "switched in")
-        self.l_need = self.p_c.line(C_BEFORE, 1.6, "required for 0.95", dash=True)
+        self.l_need = self.p_c.line(C_BEFORE, 1.6, "required for PF %.2f" % PF_TARGET, dash=True)
         self.p_c.hover([(self.l_cap, "on", lambda y: "%.1f µF" % y), (self.l_need, "req", lambda y: "%.2f µF" % y)], sec)
         cc.body.addWidget(self.p_c)
         for p in (self.p_pf, self.p_c):
@@ -952,7 +968,7 @@ class Dashboard(QtWidgets.QMainWindow):
         ms = lambda x: "t = %.2f ms" % x
         ca = Card("AHF injected current vs target reference", "each normalised to its own peak")
         self.ahf_card_sub = ca.sub
-        self.p_a = Plot("p.u.", "time within one 50 Hz cycle  [ms]", 250)
+        self.p_a = Plot("p.u.", "time  [ms]  ·  %d cycles" % N_SHOW, 250)
         self.p_a.legend()
         self.l_a = self.p_a.line(C_AHF, 2.2, "I_ahf measured (ACS712 #2)")
         self.l_t = self.p_a.line(C_REF, 1.6, "target  -(I - I₁)", dash=True)
@@ -962,14 +978,14 @@ class Dashboard(QtWidgets.QMainWindow):
 
         cc = Card("Grid current: before vs after compensation", "")
         self.corr_sub = cc.sub
-        self.p_c2 = Plot("A", "time within one 50 Hz cycle  [ms]", 250)
+        self.p_c2 = Plot("A", "time  [ms]  ·  %d cycles" % N_SHOW, 250)
         self.p_c2.legend()
         self.l_c0 = self.p_c2.line(C_BEFORE, 1.4, "before")
         self.l_c = self.p_c2.line(C_AFTER, 2.4, "after  (I + I_ahf)")
         self.p_c2.hover([(self.l_c0, "before", lambda y: "%.3f A" % y), (self.l_c, "after", lambda y: "%.3f A" % y)], ms)
         cc.body.addWidget(self.p_c2)
         for p in (self.p_a, self.p_c2):
-            p.setXRange(0, 1000.0 / F_GRID, padding=0.01)
+            p.setXRange(0, N_SHOW * 1000.0 / F_GRID, padding=0.01)
         lay.addLayout(_row(ca, cc), 1)
 
         hx = np.arange(2, N_H + 1)
@@ -1085,8 +1101,13 @@ class Dashboard(QtWidgets.QMainWindow):
 
         f_hz = m["freq"] if 40.0 < m["freq"] < 70.0 else F_GRID   # old firmware sends no freq
 
-        def xs(y):
-            return np.arange(y.size) * (1000.0 / f_hz / y.size)
+        def xs(y):                   # time axis for N_SHOW cycles
+            return np.arange(N_SHOW * y.size) * (1000.0 / f_hz / y.size)
+
+        if new_frame and abs(f_hz - self._lim.get("f", 0.0)) > 0.05:
+            self._lim["f"] = f_hz
+            for p in (self.p_v, self.p_i, self.p_a, self.p_c2):
+                p.setXRange(0, N_SHOW * 1000.0 / f_hz, padding=0.01)
 
         yv, yi, ya, yt, yc = (w.get(n) for n in ("V", "I", "A", "T", "C"))
         hi = s["h"]["I"]
@@ -1098,10 +1119,10 @@ class Dashboard(QtWidgets.QMainWindow):
 
         # ---- common: V and I ------------------------------------------------
         if yv is not None and yv.size:
-            self.l_v.setData(xs(yv), yv)
+            self.l_v.setData(xs(yv), cyc(yv))
             self._yscale(self.p_v, "v", [yv], 10.0)
         if yi is not None and yi.size:
-            self.l_i.setData(xs(yi), yi)
+            self.l_i.setData(xs(yi), cyc(yi))
             self._yscale(self.p_i, "i", [yi], 0.05)
         self.c_v.sub.setText("%.1f V rms  ·  %.2f Hz  ·  THD %.1f %%" % (m["vrms"], f_hz, m["thd_v"]))
         self.c_i.sub.setText("%.3f A rms  ·  THD %.1f %%  ·  crest %.2f" % (m["irms"], m["thd_i"], m["crest"]))
@@ -1121,7 +1142,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.s_vr.set("%.1f" % m["vrms"], "V rms", "peak %.1f V" % m["vpk"])
         self.s_ir.set("%.3f" % m["irms"], "A rms", "peak %.3f A" % m["ipk"])
         self.s_cap.set("%.1f" % pfc["cap"], "µF")
-        self.s_req.set("%.2f" % pfc["c_need"], "µF", "for PF 0.95")
+        self.s_req.set("%.2f" % pfc["c_need"], "µF", "for PF %.2f" % PF_TARGET)
 
         mask = int(k["mask"])
         st, tgt = int(pfc["state"]), int(pfc["target"])
@@ -1142,12 +1163,23 @@ class Dashboard(QtWidgets.QMainWindow):
                 edge = C_WARN
             _css(b, _btn_style(face, edge, C_GOOD if on else FG2, 2 if locked else 1))
         self.bank_sub.setText("%d of 3 on" % bin(st).count("1"))
-        self.apfc_txt.setText("Controller: <b>%s</b>  ·  installed %.1f µF  ·  required %.2f µF<br>"
-                              "Click a step to override it; click again to cycle MAN ON → MAN OFF → AUTO.<br>"
-                              "Safety timing: a capacitor stays ON at least %g s and OFF at least %g s; "
-                              "relays switch at the voltage peak."
-                              % ("HOLD" if int(pfc["hold"]) else "SWITCHING", pfc["cap"], pfc["c_need"],
-                                 RELAY_MIN_ON_S, CAP_RECLOSE_S))
+        why = {1: "no load (V &lt; 10 V or P &lt; 0.5 W)",
+               2: "load needs only %.2f µF, less than half the smallest step (%.2f µF): "
+                  "switching it in would not improve PF" % (pfc["c_need"], min(CAP_UF) / 2),
+               3: "all steps are manual"}.get(int(pfc["why"]), "")
+        wl = int(pfc["wlock"])
+        wait = ", ".join("%g µF" % CAP_UF[j] for j in range(3) if wl >> j & 1)
+        self.apfc_txt.setText(
+            "Controller: <b>%s</b>%s  ·  installed %.1f µF  ·  required %.2f µF<br>"
+            "Grid lock: <b>%s</b>%s<br>"
+            "Click a step to override it; click again to cycle MAN ON → MAN OFF → AUTO.<br>"
+            "Safety timing: a capacitor stays ON at least %g s and OFF at least %g s; "
+            "relays switch at the voltage peak."
+            % ("HOLD" if int(pfc["hold"]) else "SWITCHING", (" — " + why) if why else "",
+               pfc["cap"], pfc["c_need"],
+               "yes" if int(pfc["lock"]) else "no",
+               ("  ·  waiting for lock: " + wait) if wait else "",
+               RELAY_MIN_ON_S, CAP_RECLOSE_S))
 
         if self.hist:
             h = np.asarray(self.hist)
@@ -1192,17 +1224,17 @@ class Dashboard(QtWidgets.QMainWindow):
             return y / pk if pk > 1e-9 else y
         an, tn = norm(ya), norm(yt)
         if an is not None:
-            self.l_a.setData(xs(ya), an)
+            self.l_a.setData(xs(ya), cyc(an))
         if tn is not None:
-            self.l_t.setData(xs(yt), tn)
+            self.l_t.setData(xs(yt), cyc(tn))
         self.ahf_card_sub.setText("normalised to own peak  ·  peak %.3f / %.3f A  ·  ρ %s"
                                   % (ahf["peak"], ahf["ref_peak"], "--" if math.isnan(rho) else "%.3f" % rho))
 
         # before / after
         if yi is not None and yi.size:
-            self.l_c0.setData(xs(yi), yi)
+            self.l_c0.setData(xs(yi), cyc(yi))
         if yc is not None and yc.size:
-            self.l_c.setData(xs(yc), yc)
+            self.l_c.setData(xs(yc), cyc(yc))
         self._yscale(self.p_c2, "c", [yi, yc], 0.05)
         self.corr_sub.setText("THD %.1f %% → %s" % (m["thd_i"], "--" if math.isnan(thd_after) else "%.1f %%" % thd_after))
 
