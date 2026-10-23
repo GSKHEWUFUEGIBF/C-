@@ -105,7 +105,8 @@
 
 #define V_DEADBAND         5.0f
 #define I_DEADBAND         0.03f
-#define A_DEADBAND         0.05f      /* sensor A rms below this is shown as 0 */
+#define A_DEADBAND         0.05f      /* sensor A rms shown as 0 below this,
+                                       * only while the bridge is not driving */
 #define A_LPF_HZ           1000.0f    /* 2nd-order Butterworth low-pass on
                                        * sensor A (h15 = 750 Hz passes; its
                                        * gain/phase is divided back out per
@@ -1014,12 +1015,30 @@ static void process_window(const uint16_t *s, win_t *m)
         ba[h] = -x.im;
     }
 
-    /* Noise floor: below A_DEADBAND sensor A is shown as 0 (telemetry only;
-     * the AHF loop still uses the real values in aa/ba).                   */
+    /* Noise floor (telemetry only; the AHF loop always uses aa/ba): while
+     * the bridge is not driving, a small sensor-A reading is pure noise and
+     * is shown as 0. While it drives, the real current is shown however
+     * small - the charger's harmonics need only ~0.04 A.                   */
     float a2 = 0.0f;
     for (uint32_t k = 0; k < N_CYC; k++) a2 += w_a[k] * w_a[k];
-    const bool a_on = sqrtf(a2 / (float)N_CYC) >= A_DEADBAND;
-    if (!a_on) { memset(w_a, 0, sizeof w_a); apk = 0.0f; }
+    const bool driving = ahf_active && ahf_duty_pk > 0.005f;
+    const bool a_on    = driving || sqrtf(a2 / (float)N_CYC) >= A_DEADBAND;
+
+    /* Shown waveform = the filter-corrected harmonics h1..h15: in time with
+     * sensor I and the target, without the filter's lag or the noise.      */
+    memset(w_a, 0, sizeof w_a);
+    apk = 0.0f;
+    if (a_on) {
+        for (uint32_t h = 1; h <= MAX_H; h++) {
+            uint32_t idx = 0;
+            for (uint32_t k = 0; k < N_CYC; k++) {
+                w_a[k] += aa[h] * cos_t[idx] + ba[h] * sin_t[idx];
+                idx += h;
+                if (idx >= N_CYC) idx -= N_CYC;
+            }
+        }
+        for (uint32_t k = 0; k < N_CYC; k++) if (fabsf(w_a[k]) > apk) apk = fabsf(w_a[k]);
+    }
     m->apk = apk;
     float hv[MAX_H + 1];
     for (uint32_t h = 1; h <= MAX_H; h++) {
@@ -1050,22 +1069,12 @@ static void process_window(const uint16_t *s, win_t *m)
     for (uint32_t k = 0; k < N_CYC; k++) {
         float i_fund = ai[1] * cos_t[k] + bi[1] * sin_t[k];
         w_t[k] = -(w_i[k] - i_fund);
-        w_c[k] = w_i[k];
-    }
-#if !AHF_SENSE_GRID
-    /* load + injection; the injection is rebuilt from its filter-corrected
-     * harmonics so it lines up in time with the unfiltered sensor I        */
-    if (a_on) {
-        for (uint32_t h = 1; h <= MAX_H; h++) {
-            uint32_t idx = 0;
-            for (uint32_t k = 0; k < N_CYC; k++) {
-                w_c[k] += AHF_INJ_RATIO * (aa[h] * cos_t[idx] + ba[h] * sin_t[idx]);
-                idx += h;
-                if (idx >= N_CYC) idx -= N_CYC;
-            }
-        }
-    }
+#if AHF_SENSE_GRID
+        w_c[k] = w_i[k];                                   /* already the grid */
+#else
+        w_c[k] = w_i[k] + AHF_INJ_RATIO * w_a[k];          /* load + injection */
 #endif
+    }
 }
 
 /* clean: the AHF table did not change during this window, so sensor A shows
