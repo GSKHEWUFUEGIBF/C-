@@ -87,6 +87,23 @@ int main(void)
     printf("  %s  STANDBY: sensor A noise hidden (peak %.3f A), grid THD unchanged %.0f %%\n",
            ok ? "PASS" : "FAIL", apk, ta);
     fails += !ok;
+    /* all measured values for one fixed input (compared with and without the
+     * display filter by run_sim.sh - they must be identical)               */
+    srand(42);
+    run(1, 1.0, &tb, &ta, &apk);
+    printf("  METRICS vrms=%.6f irms=%.6f p=%.6f s=%.6f pf=%.6f p1=%.6f q1=%.6f dpf=%.6f dva=%.6f "
+           "thdv=%.6f thdi=%.6f crest=%.6f h3=%.6f h5=%.6f thdc=%.6f apk=%.6f\n",
+           mw.vrms, mw.irms, mw.p, mw.s, mw.pf, mw.p1, mw.q1, mw.dpf, mw.dva,
+           mw.thd_v, mw.thd_i, mw.crest, mw.h_i[3], mw.h_i[5], mw.thd_c, mw.apk);
+    {   /* the exact after-THD the firmware now sends, against the same quantity
+         * taken from the displayed (smoothed) I + I_ahf curve                 */
+        float x[MAX_H + 1], y[MAX_H + 1], hh[MAX_H + 1];
+        dft(w_c, x, y);
+        for (unsigned h = 1; h <= MAX_H; h++) hh[h] = sqrtf(x[h] * x[h] + y[h] * y[h]);
+        printf("  INFO  same run: THD before %.1f %%, after (exact, sent) %.1f %%, after from displayed curve %.1f %%\n",
+               mw.thd_i, mw.thd_c, thd_pct(hh));
+    }
+
     /* mains OFF: only ZMPT101B/ADC noise on the voltage channel (~7 counts rms,
      * about 5.7 V rms, as seen on the hardware) - must read as no voltage */
     {

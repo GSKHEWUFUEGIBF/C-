@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Builds the register-free parts of ../main.c on the PC and runs:
 #   sim        - AHF selective-harmonic loop and grid PLL
 #   relay_sim  - capacitor relay timing rules and point-on-wave switching,
@@ -23,7 +23,19 @@ static float av[MAX_H + 1], bv[MAX_H + 1], ai[MAX_H + 1], bi[MAX_H + 1],
 G
 awk '$0 ~ "^static void process_window\\(" {p=1} p {print} p && /^}/ {exit}' ../main.c > "$out/proc_fn.h"
 cc $CFLAGS -I"$out" proc_sim.c -lm -o "$out/proc_sim"
-"$out/proc_sim"
+"$out/proc_sim" | tee "$out/proc_filt.txt" | grep -v METRICS
+# same process_window() with the display filter calls removed: every
+# measured value must be bit-identical
+mkdir -p "$out/nofilt"
+cp "$out/core.h" "$out/proc_glob.h" "$out/nofilt/"
+sed 's/lpf_zero_phase(&vi_lpf, w_[vi]);/{ }/' "$out/proc_fn.h" > "$out/nofilt/proc_fn.h"
+cc $CFLAGS -I"$out/nofilt" proc_sim.c -lm -o "$out/proc_nofilt"
+"$out/proc_nofilt" > "$out/proc_nofilt.txt"
+if diff <(grep METRICS "$out/proc_filt.txt") <(grep METRICS "$out/proc_nofilt.txt") >/dev/null; then
+  echo "  PASS  display filter changes no measured value (V, I, P, Q, PF, THD, harmonics identical)"
+else
+  echo "  FAIL  display filter changed a measured value"; diff <(grep METRICS "$out/proc_filt.txt") <(grep METRICS "$out/proc_nofilt.txt")
+fi
 
 # relay functions, copied verbatim
 fn() { awk -v f="$1" '$0 ~ "^static .*[ *]" f "\\(" {p=1} p {print} p && /^}/ {exit}' ../main.c; }

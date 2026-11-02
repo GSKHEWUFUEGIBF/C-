@@ -41,7 +41,8 @@
  *
  *  Telemetry changes (backwards compatible, fields appended / reused)
  *    $M  ... ,freq                 measured grid frequency [Hz]
- *    $A  active,apk,ref_pk,duty_pk,resid_pct
+ *    $A  active,apk,ref_pk,duty_pk,resid_pct,thd_after
+ *    $H,C                          after-compensation harmonics h1..h15
  *    $P  ... ,lock,reason,wait_lock      grid lock, why the bank holds,
  *                                        caps waiting for the lock
  *    $W,C                          I + A (measured), was an ideal sine
@@ -114,6 +115,9 @@
 #define I_DEADBAND         0.03f
 #define A_DEADBAND         0.05f      /* sensor A rms shown as 0 below this,
                                        * only while the bridge is not driving */
+#define VI_LPF_HZ          1500.0f    /* zero-phase Butterworth smoothing of the
+                                       * V and I waveforms sent for display;
+                                       * measurements use the raw samples      */
 #define A_LPF_HZ           1000.0f    /* 2nd-order Butterworth low-pass on
                                        * sensor A (h15 = 750 Hz passes; its
                                        * gain/phase is divided back out per
@@ -249,6 +253,7 @@ static float tan_phi_tgt;
 
 typedef struct { float b0, b1, b2, a1, a2; } biquad_t;
 static biquad_t a_lpf;                  /* sensor A low-pass                  */
+static biquad_t vi_lpf;                 /* V/I display smoothing              */
 static cpx_t    a_lpf_h[MAX_H + 1];     /* its response at each harmonic      */
 
 static int16_t ahf_tab[2][N_CYC];       /* Q15 duty, one cycle, played by ISR */
@@ -277,15 +282,48 @@ static void ahf_model_init(void)
 /* 2nd-order Butterworth low-pass (bilinear, pre-warped) and its exact
  * response at every harmonic. The sample clock is locked to 200 samples per
  * cycle, so harmonic h is always at 2*pi*h/200 rad/sample.                 */
+static void butter2(float fc, biquad_t *f)
+{
+    const float k = tanf(3.14159265f * fc / (float)FS_HZ);
+    const float n = 1.0f / (1.0f + 1.41421356f * k + k * k);
+    f->b0 = k * k * n;
+    f->b1 = 2.0f * f->b0;
+    f->b2 = f->b0;
+    f->a1 = 2.0f * (k * k - 1.0f) * n;
+    f->a2 = (1.0f - 1.41421356f * k + k * k) * n;
+}
+
+/* Zero-phase low-pass of one periodic cycle: the biquad runs forward, then
+ * backward, each time wrapping around the cycle once first so its state is
+ * already settled. Net response |H|^2 with no phase shift, so filtered V, I
+ * and AHF waveforms stay exactly aligned in time. Display only.            */
+static void lpf_zero_phase(const biquad_t *f, float *x)
+{
+    static float y[N_CYC];
+    float z1 = 0.0f, z2 = 0.0f;
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t k = 0; k < N_CYC; k++) {
+            const float o = f->b0 * x[k] + z1;
+            z1 = f->b1 * x[k] - f->a1 * o + z2;
+            z2 = f->b2 * x[k] - f->a2 * o;
+            y[k] = o;
+        }
+    }
+    z1 = z2 = 0.0f;
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t k = N_CYC; k-- > 0u; ) {
+            const float o = f->b0 * y[k] + z1;
+            z1 = f->b1 * y[k] - f->a1 * o + z2;
+            z2 = f->b2 * y[k] - f->a2 * o;
+            if (pass) x[k] = o;
+        }
+    }
+}
+
 static void lpf_init(void)
 {
-    const float k = tanf(3.14159265f * A_LPF_HZ / (float)FS_HZ);
-    const float n = 1.0f / (1.0f + 1.41421356f * k + k * k);
-    a_lpf.b0 = k * k * n;
-    a_lpf.b1 = 2.0f * a_lpf.b0;
-    a_lpf.b2 = a_lpf.b0;
-    a_lpf.a1 = 2.0f * (k * k - 1.0f) * n;
-    a_lpf.a2 = (1.0f - 1.41421356f * k + k * k) * n;
+    butter2(A_LPF_HZ, &a_lpf);
+    butter2(VI_LPF_HZ, &vi_lpf);
     for (uint32_t h = 0; h <= MAX_H; h++) {
         const float w  = TWO_PI * (float)h / (float)N_CYC;
         const cpx_t z1 = c_mk(cosf(w), -sinf(w));            /* z^-1 */
@@ -473,7 +511,7 @@ static float av[MAX_H + 1], bv[MAX_H + 1], ai[MAX_H + 1], bi[MAX_H + 1],
 typedef struct {
     float vrms, irms, p, s, pf, p1, q1, dpf, dva;
     float thd_v, thd_i, crest, vpk, ipk, apk;
-    float h_i[MAX_H + 1], h_a[MAX_H + 1];
+    float h_i[MAX_H + 1], h_a[MAX_H + 1], h_c[MAX_H + 1], thd_c;
     float off[N_CH];
     uint16_t mn[N_CH], mx[N_CH];
     uint32_t clip[N_CH];
@@ -1073,6 +1111,25 @@ static void process_window(const uint16_t *s, win_t *m)
         m->p1 = m->q1 = m->dpf = m->dva = 0.0f;
     }
 
+    /* Grid current after compensation, per harmonic, from the exact phasors
+     * (sent as $H,C so the dashboard does not have to use a smoothed curve). */
+    for (uint32_t h = 1; h <= MAX_H; h++) {
+#if AHF_SENSE_GRID
+        const float a = ai[h], b = bi[h];
+#else
+        const float a = ai[h] + (a_on ? AHF_INJ_RATIO * aa[h] : 0.0f);
+        const float b = bi[h] + (a_on ? AHF_INJ_RATIO * ba[h] : 0.0f);
+#endif
+        m->h_c[h] = 0.70710678f * sqrtf(a * a + b * b);
+    }
+    m->h_c[0] = 0.0f;
+    m->thd_c  = (m->irms > 0.0f) ? thd_pct(m->h_c) : 0.0f;
+
+    /* Display waveforms: zero-phase Butterworth removes ADC/sensor noise.
+     * Every number above was computed from the unfiltered data.            */
+    if (m->vrms > 0.0f) lpf_zero_phase(&vi_lpf, w_v);
+    if (m->irms > 0.0f) lpf_zero_phase(&vi_lpf, w_i);
+
     for (uint32_t k = 0; k < N_CYC; k++) {
         float i_fund = ai[1] * cos_t[k] + bi[1] * sin_t[k];
         w_t[k] = -(w_i[k] - i_fund);
@@ -1310,6 +1367,7 @@ static void telemetry_send(const win_t *m, const avg_t *a)
 
     tx_s("$H,I"); for (uint32_t h = 1; h <= MAX_H; h++) tx_cf(m->h_i[h], 4); tx_c('\n');
     tx_s("$H,A"); for (uint32_t h = 1; h <= MAX_H; h++) tx_cf(m->h_a[h], 4); tx_c('\n');
+    tx_s("$H,C"); for (uint32_t h = 1; h <= MAX_H; h++) tx_cf(m->h_c[h], 4); tx_c('\n');
 
     uint8_t mask, lst;
     locks_read(&mask, &lst);
@@ -1318,7 +1376,7 @@ static void telemetry_send(const win_t *m, const avg_t *a)
     tx_cu(pll_locked); tx_cu(pfc_reason); tx_cu(relay_waiting); tx_c('\n');
 
     tx_s("$A"); tx_cu(ahf_active); tx_cf(m->apk, 4); tx_cf(ahf_ref_pk_f, 4);
-    tx_cf(ahf_duty_pk, 3); tx_cf(ahf_resid_pct, 1); tx_c('\n');
+    tx_cf(ahf_duty_pk, 3); tx_cf(ahf_resid_pct, 1); tx_cf(m->thd_c, 2); tx_c('\n');
 
     tx_s("$K"); tx_cu(mask); tx_cu(lst); tx_cu(cmd_ok); tx_cu(cmd_bad); tx_cu(rx_bytes);
     tx_c('\n');

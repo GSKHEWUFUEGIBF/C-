@@ -208,6 +208,33 @@ int main(void)
         CHECK(out2 / in2 < 0.4, "white sensor noise reduced to %.0f %% rms", 100 * sqrt(out2 / in2));
     }
 
+    printf("\nV/I display smoothing: zero-phase Butterworth (%.0f Hz)\n", (double)VI_LPF_HZ);
+    {
+        float worst_ph = 0, g1 = 0, g15 = 0;
+        for (unsigned h = 1; h <= MAX_H; h++) {
+            float x[N_CYC], a1[MAX_H + 1], b1[MAX_H + 1], a2[MAX_H + 1], b2[MAX_H + 1];
+            for (unsigned k = 0; k < N_CYC; k++) x[k] = (float)cos(6.283185307 * h * k / N_CYC + 0.4);
+            dft(x, a1, b1);
+            lpf_zero_phase(&vi_lpf, x);
+            dft(x, a2, b2);
+            float ph = fabsf((float)wrap_pi((float)(atan2(-b2[h], a2[h]) - atan2(-b1[h], a1[h]))));
+            float g = sqrtf(a2[h]*a2[h] + b2[h]*b2[h]) / sqrtf(a1[h]*a1[h] + b1[h]*b1[h]);
+            if (ph > worst_ph) worst_ph = ph;
+            if (h == 1) g1 = g;
+            if (h == 15) g15 = g;
+        }
+        CHECK(worst_ph < 1e-4f, "no phase shift at h1..h15 (worst %.5f deg); gain h1 %.5f, h15 %.3f",
+              worst_ph * 57.2958f, g1, g15);
+        double in2 = 0, out2 = 0;
+        for (int r = 0; r < 200; r++) {
+            float x[N_CYC];
+            for (unsigned k = 0; k < N_CYC; k++) { x[k] = (float)gauss(); in2 += x[k] * x[k]; }
+            lpf_zero_phase(&vi_lpf, x);
+            for (unsigned k = 0; k < N_CYC; k++) out2 += x[k] * x[k];
+        }
+        CHECK(out2 / in2 < 0.36, "sensor noise on the displayed waveform reduced to %.0f %% rms", 100 * sqrt(out2 / in2));
+    }
+
     printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
     return fails != 0;
 }

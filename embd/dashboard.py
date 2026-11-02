@@ -54,7 +54,7 @@ N_H = 15
 M_KEYS = ("vrms", "irms", "p", "s", "q", "pf", "thd_v", "thd_i", "crest",
           "vpk", "ipk", "dpf", "dva", "freq")
 P_KEYS = ("state", "cap", "pf", "q", "hold", "target", "c_need", "lock", "why", "wlock")
-A_KEYS = ("active", "peak", "ref_peak", "duty", "resid")   # duty: table peak, resid: loop error %
+A_KEYS = ("active", "peak", "ref_peak", "duty", "resid", "thd_c")  # duty: table peak, resid: loop error %
 K_KEYS = ("mask", "state", "ok", "bad", "rx")
 R_KEYS = ("off_v", "min_v", "max_v", "clip_v", "off_i", "min_i", "max_i", "clip_i",
           "off_a", "min_a", "max_a", "clip_a", "adc_ovr", "win_drop", "tx_skip")
@@ -382,10 +382,11 @@ class DemoLink(threading.Thread):
                                                   F_GRID + 0.03 * math.sin(t / 20))),
             "$H,I," + ",".join("%.4f" % x for x in hi),
             "$H,A," + ",".join("%.4f" % x for x in ha),
+            "$H,C," + ",".join("%.4f" % x for x in _spectrum(i_corr)),
             "$P,%d,%.1f,%.4f,%.2f,%d,%d,%.2f,1,%d,0" % (self.relays, self._cap(self.relays), pf, q1,
                                                        self.hold, self.target, self.c_need, self.why),
-            "$A,%d,%.4f,%.4f,%.3f,%.1f" % (self.ahf_on, np.max(np.abs(a)), pk, duty,
-                                            resid if self.ahf_on else 0.0),
+            "$A,%d,%.4f,%.4f,%.3f,%.1f,%.2f" % (self.ahf_on, np.max(np.abs(a)), pk, duty,
+                                                 resid if self.ahf_on else 0.0, thd(_spectrum(i_corr))),
             "$K,%d,%d,%d,%d,%d" % (self.lock_mask, self.lock_state, self.ok, self.bad, self.rx),
             "$R," + raw(v, 3.3 / 4095 * 1014) + "," + raw(i, k_i) + "," + raw(a, k_i) + ",0,0,0",
             "$E",
@@ -1111,7 +1112,9 @@ class Dashboard(QtWidgets.QMainWindow):
 
         yv, yi, ya, yt, yc = (w.get(n) for n in ("V", "I", "A", "T", "C"))
         hi = s["h"]["I"]
-        hc = _spectrum(yc)
+        # after-compensation harmonics: exact values from the firmware ($H,C);
+        # older firmware does not send them, then they come from the I + I_ahf curve
+        hc = s["h"]["C"] if "C" in s["h"] else _spectrum(yc)
         thd_after = _thd(hc)
         if new_frame:
             self.hist.append((now - self._t0, m["pf"], m["dpf"], pfc["cap"], pfc["c_need"],

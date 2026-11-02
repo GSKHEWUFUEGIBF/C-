@@ -37,6 +37,8 @@ Before flashing, set in `main.c`:
 | `RELAY_SSR_MASK` | Bit set = that pin drives an active-HIGH SSR (default `0x4`: PB2). Clear = 5 V active-LOW relay module. |
 | `PF_TARGET` | 0.99: AUTO switches a step in whenever it brings PF closer. |
 | `RELAY_MIN_ON_MS`, `CAP_RECLOSE_MS` | 5 s minimum ON and OFF time for each capacitor. |
+| `VI_LPF_HZ` | Zero-phase Butterworth smoothing (1.5 kHz) of the voltage and current waveforms shown on the dashboard. Display only: all measured values come from the raw samples. |
+| `V_DEADBAND` | 20 V: below this the mains is treated as OFF (sensor noise reads ~6 V with no mains). |
 | `A_LPF_HZ`, `A_DEADBAND` | Butterworth low-pass and noise floor for the AHF current sensor (ACS712 #2). |
 | `RELAY_SYNC`, `RELAY_T_OP_MS`, `RELAY_T_REL_MS` | Relay modules open just before and close at the voltage peak, so a capacitor without a bleeder resistor is reconnected with ~0 V across the contacts. |
 
