@@ -57,7 +57,7 @@ P_KEYS = ("state", "cap", "pf", "q", "hold", "target", "c_need", "lock", "why", 
 A_KEYS = ("active", "peak", "ref_peak", "duty", "resid", "thd_c")  # duty: table peak, resid: loop error %
 K_KEYS = ("mask", "state", "ok", "bad", "rx")
 R_KEYS = ("off_v", "min_v", "max_v", "clip_v", "off_i", "min_i", "max_i", "clip_i",
-          "off_a", "min_a", "max_a", "clip_a", "adc_ovr", "win_drop", "tx_skip")
+          "off_a", "min_a", "max_a", "clip_a", "adc_ovr", "win_drop", "tx_skip", "noise_i")
 # =========================================================================== #
 #  Thread-safe telemetry store                                                #
 # =========================================================================== #
@@ -388,7 +388,7 @@ class DemoLink(threading.Thread):
             "$A,%d,%.4f,%.4f,%.3f,%.1f,%.2f" % (self.ahf_on, np.max(np.abs(a)), pk, duty,
                                                  resid if self.ahf_on else 0.0, thd(_spectrum(i_corr))),
             "$K,%d,%d,%d,%d,%d" % (self.lock_mask, self.lock_state, self.ok, self.bad, self.rx),
-            "$R," + raw(v, 3.3 / 4095 * 1014) + "," + raw(i, k_i) + "," + raw(a, k_i) + ",0,0,0",
+            "$R," + raw(v, 3.3 / 4095 * 1014) + "," + raw(i, k_i) + "," + raw(a, k_i) + ",0,0,0,0.0300",
             "$E",
         ]
         return "\n".join(lines) + "\n"
@@ -1271,12 +1271,14 @@ class Dashboard(QtWidgets.QMainWindow):
             "  I   %7.1f  %5d  %5d %5d\n"
             "  A   %7.1f  %5d  %5d %5d\n"
             "ovr %d  drop %d  tx-skip %d  %s\n"
+            "I sensor noise %.0f mA rms (removed)\n"
             "UART  cmd ok %d  bad %d  rx %d B\n"
             "AHF   duty pk %.2f  residual %.1f %%"
             % (r["off_v"], r["min_v"], r["max_v"], r["clip_v"],
                r["off_i"], r["min_i"], r["max_i"], r["clip_i"],
                r["off_a"], r["min_a"], r["max_a"], r["clip_a"],
                r["adc_ovr"], r["win_drop"], r["tx_skip"], "CLIPPING!" if clip else "",
+               1000 * r["noise_i"],
                k["ok"], k["bad"], k["rx"], ahf["duty"], ahf["resid"]))
         _css(self.diag, "color:%s" % (C_BAD if clip else FG2))
 

@@ -43,6 +43,7 @@
  *    $M  ... ,freq                 measured grid frequency [Hz]
  *    $A  active,apk,ref_pk,duty_pk,resid_pct,thd_after
  *    $H,C                          after-compensation harmonics h1..h15
+ *    $R  ... ,i_noise              grid-current sensor noise [A rms]
  *    $P  ... ,lock,reason,wait_lock      grid lock, why the bank holds,
  *                                        caps waiting for the lock
  *    $W,C                          I + A (measured), was an ideal sine
@@ -112,7 +113,8 @@
 #define V_DEADBAND         20.0f      /* below this the mains is treated as OFF:
                                        * ZMPT101B + ADC noise with no mains is
                                        * ~6 V rms, a real 230 V grid never this low */
-#define I_DEADBAND         0.03f
+#define I_DEADBAND         0.02f      /* grid current (noise already removed,
+                                       * see process_window) below this = 0  */
 #define A_DEADBAND         0.05f      /* sensor A rms shown as 0 below this,
                                        * only while the bridge is not driving */
 #define VI_LPF_HZ          1500.0f    /* zero-phase Butterworth smoothing of the
@@ -510,7 +512,7 @@ static float av[MAX_H + 1], bv[MAX_H + 1], ai[MAX_H + 1], bi[MAX_H + 1],
 
 typedef struct {
     float vrms, irms, p, s, pf, p1, q1, dpf, dva;
-    float thd_v, thd_i, crest, vpk, ipk, apk;
+    float thd_v, thd_i, crest, vpk, ipk, apk, i_noise;
     float h_i[MAX_H + 1], h_a[MAX_H + 1], h_c[MAX_H + 1], thd_c;
     float off[N_CH];
     uint16_t mn[N_CH], mx[N_CH];
@@ -1029,8 +1031,30 @@ static void process_window(const uint16_t *s, win_t *m)
         if (fi > ipk) ipk = fi;
         if (fv > vpk) vpk = fv;
     }
-    m->irms = sqrtf(si2 / (float)N_WIN);
     m->vrms = sqrtf(sv2 / (float)N_WIN);
+
+    /* Grid current: separate the part that repeats every cycle (the load)
+     * from the part that does not (ACS712 + ADC noise, ~30 mA rms). Over K
+     * averaged cycles  raw^2 = S^2 + N^2  and  averaged^2 = S^2 + N^2/K,
+     * so S^2 = (K*averaged^2 - raw^2)/(K-1). Noise is uncorrelated with the
+     * voltage, so P is unaffected; Irms, S, PF and D no longer include it.
+     * The peak is taken from the averaged cycle for the same reason.       */
+    {
+        const float inv_k = 1.0f / (float)CYC_PER_WIN;
+        float c2 = 0.0f, cpk = 0.0f;
+        for (uint32_t k = 0; k < N_CYC; k++) {
+            const float d = ((float)csum[SLOT_I][k] * inv_k - oi) * K_I;
+            c2 += d * d;
+            if (fabsf(d) > cpk) cpk = fabsf(d);
+        }
+        c2 /= (float)N_CYC;
+        const float r2 = si2 / (float)N_WIN;
+        float s2 = ((float)CYC_PER_WIN * c2 - r2) / (float)(CYC_PER_WIN - 1u);
+        if (s2 < 0.0f) s2 = 0.0f;
+        m->i_noise = (r2 > s2) ? sqrtf(r2 - s2) : 0.0f;
+        m->irms    = sqrtf(s2);
+        ipk        = cpk;
+    }
 
     if (m->vrms < V_DEADBAND) { m->vrms = 0.0f; vpk = 0.0f; }
     if (m->irms < I_DEADBAND) { m->irms = 0.0f; ipk = 0.0f; }
@@ -1387,7 +1411,7 @@ static void telemetry_send(const win_t *m, const avg_t *a)
         const uint32_t c = order[j];
         tx_cf(m->off[c], 1); tx_cu(m->mn[c]); tx_cu(m->mx[c]); tx_cu(m->clip[c]);
     }
-    tx_cu(adc_ovr_cnt); tx_cu(win_dropped); tx_cu(tx_skip);
+    tx_cu(adc_ovr_cnt); tx_cu(win_dropped); tx_cu(tx_skip); tx_cf(m->i_noise, 4);
     tx_c('\n');
 
     tx_s("$E\n");

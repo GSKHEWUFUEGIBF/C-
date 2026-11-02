@@ -104,6 +104,62 @@ int main(void)
                mw.thd_i, mw.thd_c, thd_pct(hh));
     }
 
+    /* grid-current noise floor: ACS712 + ADC noise of ~4.7 counts rms
+     * (~0.031 A rms with the divider, as on the hardware)                    */
+    {
+        static uint16_t buf[N_WIN * N_CH];
+        const double sig = 4.7;
+        int shown = 0; double worst = 0, raw_mean = 0;
+        for (int w = 0; w < 200; w++) {                 /* 20 s of windows, no load */
+            double r2 = 0;
+            for (unsigned n = 0; n < N_WIN; n++) {
+                unsigned k = n % N_CYC;
+                double nz = sig * gauss();
+                buf[n * N_CH + SLOT_I] = (uint16_t)lrint(2068 + nz);
+                buf[n * N_CH + SLOT_V] = (uint16_t)lrint(3130 + 400 * cos(6.28318531 * k / N_CYC));
+                buf[n * N_CH + SLOT_A] = (uint16_t)lrint(3130 + 6 * gauss());
+                r2 += (nz * K_I) * (nz * K_I);
+            }
+            process_window(buf, &mw);
+            raw_mean += sqrt(r2 / N_WIN) / 200;
+            if (mw.irms > 0) shown++;
+            if (mw.i_noise > worst) worst = mw.i_noise;
+        }
+        ok = shown == 0;
+        printf("  %s  no load: raw noise %.3f A rms -> Irms shown 0 in %d/200 windows (noise measured %.3f A)\n",
+               ok ? "PASS" : "FAIL", raw_mean, 200 - shown, worst);
+        fails += !ok;
+
+        for (int c = 0; c < 2; c++) {                   /* small and normal real loads */
+            const double scale = c ? 1.0 : 0.22;        /* 0.044 A or 0.2 A rms */
+            double true2 = 0, got = 0, rawv = 0;
+            for (unsigned k = 0; k < N_CYC; k++) {
+                double th = 6.28318531 * k / N_CYC;
+                double i = scale * (0.25 * sin(th - 0.3) + 0.11 * i_load(th) / 0.13);
+                true2 += i * i / N_CYC;
+            }
+            for (int w = 0; w < 50; w++) {
+                double r2 = 0;
+                for (unsigned n = 0; n < N_WIN; n++) {
+                    unsigned k = n % N_CYC; double th = 6.28318531 * k / N_CYC;
+                    double i = scale * (0.25 * sin(th - 0.3) + 0.11 * i_load(th) / 0.13);
+                    double nz = sig * gauss();
+                    buf[n * N_CH + SLOT_I] = (uint16_t)lrint(2068 + i / K_I + nz);
+                    buf[n * N_CH + SLOT_V] = (uint16_t)lrint(3130 + 400 * cos(th));
+                    buf[n * N_CH + SLOT_A] = (uint16_t)lrint(3130 + 6 * gauss());
+                    r2 += (i + nz * K_I) * (i + nz * K_I);
+                }
+                process_window(buf, &mw);
+                got += mw.irms / 50; rawv += sqrt(r2 / N_WIN) / 50;
+            }
+            double tr = sqrt(true2), err = 100 * (got - tr) / tr, rerr = 100 * (rawv - tr) / tr;
+            ok = fabs(err) < (c ? 1.0 : 5.0);
+            printf("  %s  load %.3f A rms: shown %.4f A (%+.1f %%), raw rms would be %+.1f %%\n",
+                   ok ? "PASS" : "FAIL", tr, got, err, rerr);
+            fails += !ok;
+        }
+    }
+
     /* mains OFF: only ZMPT101B/ADC noise on the voltage channel (~7 counts rms,
      * about 5.7 V rms, as seen on the hardware) - must read as no voltage */
     {
