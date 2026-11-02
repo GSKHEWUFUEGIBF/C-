@@ -87,5 +87,25 @@ int main(void)
     printf("  %s  STANDBY: sensor A noise hidden (peak %.3f A), grid THD unchanged %.0f %%\n",
            ok ? "PASS" : "FAIL", apk, ta);
     fails += !ok;
+    /* mains OFF: only ZMPT101B/ADC noise on the voltage channel (~7 counts rms,
+     * about 5.7 V rms, as seen on the hardware) - must read as no voltage */
+    {
+        static uint16_t buf[N_WIN * N_CH];
+        lpf_primed = false;
+        for (unsigned n = 0; n < N_WIN; n++) {
+            buf[n * N_CH + SLOT_I] = (uint16_t)lrint(2048 + 4 * gauss());
+            buf[n * N_CH + SLOT_V] = (uint16_t)lrint(3130 + 7 * gauss());
+            buf[n * N_CH + SLOT_A] = (uint16_t)lrint(3130 + 6 * gauss());
+        }
+        process_window(buf, &mw);
+        float wmax = 0;
+        for (unsigned k = 0; k < N_CYC; k++) wmax = fmaxf(wmax, fabsf(w_v[k]));
+        double raw = 0;
+        for (unsigned n = 0; n < N_WIN; n++) { double d = (buf[n * N_CH + SLOT_V] - 3130.0) * K_V; raw += d * d; }
+        ok = mw.vrms == 0.0f && wmax == 0.0f && mw.thd_v == 0.0f;
+        printf("  %s  mains OFF: noise of %.1f V rms reads as V = %.1f V, waveform 0, THD-V %.0f %%\n",
+               ok ? "PASS" : "FAIL", sqrt(raw / N_WIN), mw.vrms, mw.thd_v);
+        fails += !ok;
+    }
     return fails;
 }

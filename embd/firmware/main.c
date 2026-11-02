@@ -108,7 +108,9 @@
 #define A_SIGN             1.0f
 #define ZMPT_LAG_DEG       0.0f
 
-#define V_DEADBAND         5.0f
+#define V_DEADBAND         20.0f      /* below this the mains is treated as OFF:
+                                       * ZMPT101B + ADC noise with no mains is
+                                       * ~6 V rms, a real 230 V grid never this low */
 #define I_DEADBAND         0.03f
 #define A_DEADBAND         0.05f      /* sensor A rms shown as 0 below this,
                                        * only while the bridge is not driving */
