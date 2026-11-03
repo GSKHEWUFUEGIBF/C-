@@ -49,6 +49,26 @@
  *    $W,C                          I + A (measured), was an ideal sine
  * ========================================================================== */
 
+/* ----------------------------------------------------------------------------
+ *  FILE MAP  (search for a tag, e.g. "[S6]")
+ *    [S1]  Constants: clocks, sampling, sensor scaling, APFC, AHF, UART
+ *    [S2]  Relay pins and point-on-wave switching times
+ *    [S3]  DSP core: complex maths, Butterworth, DFT, AHF loop, grid PLL
+ *    [S4]  Global variables
+ *    [S5]  Clock tree, GPIO, relay outputs
+ *    [S6]  Sampling chain: TIM2 -> ADC1 -> DMA2, window hand-over
+ *    [S7]  TIM4 PWM and the 10 kHz TIM2 interrupt (AHF output, relays)
+ *    [S8]  UART: telemetry DMA and command parser ($C, $A)
+ *    [S9]  Signal processing of one 100 ms window
+ *    [S10] Control: AHF step, APFC decision, relay switching
+ *    [S11] Telemetry frame ($W $M $H $P $A $K $R $E)
+ *    [S12] Interrupt priorities, window handler, main()
+ *
+ *  DATA FLOW
+ *    TIM2 10 kHz -> ADC1 scans I, V, A -> DMA2 fills one half-buffer (100 ms)
+ *    -> main loop: process_window -> grid PLL -> AHF step
+ *    -> every 0.5 s: APFC decision + telemetry frame to the PC
+ * -------------------------------------------------------------------------- */
 #include "stm32f401xe.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -58,35 +78,36 @@
 #pragma GCC optimize ("O2")
 
 /* ------------------------------------------------------------------------- */
-/*  Clocks & Sampling Constants                                              */
+/*  [S1] Constants: clocks and sampling                                      */
 /* ------------------------------------------------------------------------- */
-#define SYSCLK_HZ          64000000u
-#define APB1_TIM_HZ        64000000u
-#define APB1_HZ            32000000u
-#define ADC_CLK_HZ         16000000u
+#define SYSCLK_HZ          64000000u        /* core clock, set by clock_init() */
+#define APB1_TIM_HZ        64000000u        /* TIM2/TIM4 clock (APB1 x 2) */
+#define APB1_HZ            32000000u        /* USART2 clock */
+#define ADC_CLK_HZ         16000000u        /* APB2 64 MHz / 4 */
 
 #define FS_HZ              10000u                         /* nominal          */
-#define F_GRID_HZ          50.0f
+#define F_GRID_HZ          50.0f            /* nominal grid frequency */
 #define TWO_PI             6.28318531f
-#define N_WIN              1000u
-#define N_CYC              200u
-#define CYC_PER_WIN        (N_WIN / N_CYC)
-#define N_CH               3u
-#define DMA_LEN            (2u * N_WIN * N_CH)
-#define MAX_H              15u
+#define N_WIN              1000u            /* samples per channel per window */
+#define N_CYC              200u             /* samples per grid cycle */
+#define CYC_PER_WIN        (N_WIN / N_CYC)  /* 5 cycles per window */
+#define N_CH               3u               /* channels per scan: I, V, A */
+#define DMA_LEN            (2u * N_WIN * N_CH) /* two halves (ping-pong) */
+#define MAX_H              15u              /* highest harmonic computed */
 #define WIN_MS             (1000u * N_WIN / FS_HZ)       /* 100 ms per window */
 
+/* position of each channel inside one ADC scan */
 #define SLOT_I             0u
 #define SLOT_V             1u
 #define SLOT_A             2u
 
 #define TIM2_N_NOM         (APB1_TIM_HZ / FS_HZ)          /* 6400 ticks       */
 
-#define ADC_SMP_CYCLES     480u
-#define ADC_SMP_CODE       7u
-#define ADC_SLOT_S         ((float)(ADC_SMP_CYCLES + 12u) / (float)ADC_CLK_HZ)
-#define ADC_CLIP_LO        8u
-#define ADC_CLIP_HI        4087u
+#define ADC_SMP_CYCLES     480u             /* sampling time per channel */
+#define ADC_SMP_CODE       7u               /* register code for 480 cycles */
+#define ADC_SLOT_S         ((float)(ADC_SMP_CYCLES + 12u) / (float)ADC_CLK_HZ) /* 30.75 us per conversion */
+#define ADC_CLIP_LO        8u               /* readings at the rails */
+#define ADC_CLIP_HI        4087u            /* count as clipped */
 
 /* Grid lock (TIM2 sample clock follows the grid) */
 #define PLL_F_MIN          47.5f
@@ -96,7 +117,7 @@
 #define PLL_PHASE_SET      0.0f       /* V1 phase held at the window start   */
 
 /* Sensor Calibration */
-#define ADC_V_PER_LSB      (3.3f / 4095.0f)
+#define ADC_V_PER_LSB      (3.3f / 4095.0f) /* 12-bit, 3.3 V full scale */
 #define ACS712_V_PER_A     0.185f     /* 5 A module; 20 A = 0.100, 30 A = 0.066 */
 /* Resistor divider between an ACS712 OUT pin and its ADC pin:
  * ratio = R_bottom / (R_top + R_bottom), 1.0f = wired directly.
@@ -104,11 +125,12 @@
  * without a divider positive current clips at about +4.3 A.             */
 #define ACS_DIV_I          0.6667f    /* sensor I (PA0): 10k series, 20k to GND */
 #define ACS_DIV_A          1.0f       /* sensor A (PA4, AHF): direct            */
-#define ZMPT_V_PER_V       1014.0f
+#define ZMPT_V_PER_V       1014.0f          /* mains volts per ADC volt (calibrated) */
+/* set a sign to -1.0f if that sensor is wired the other way round */
 #define I_SIGN             1.0f
 #define V_SIGN             1.0f
 #define A_SIGN             1.0f
-#define ZMPT_LAG_DEG       0.0f
+#define ZMPT_LAG_DEG       0.0f             /* ZMPT101B phase lag correction */
 
 #define V_DEADBAND         20.0f      /* below this the mains is treated as OFF:
                                        * ZMPT101B + ADC noise with no mains is
@@ -125,33 +147,34 @@
                                        * gain/phase is divided back out per
                                        * harmonic, so the AHF loop is exact)  */
 
+/* ADC counts -> amps (K_I, K_A) and volts (K_V) */
 #define K_I   (I_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV_I))
 #define K_A   (A_SIGN * ADC_V_PER_LSB / (ACS712_V_PER_A * ACS_DIV_A))
 #define K_V   (V_SIGN * ADC_V_PER_LSB * ZMPT_V_PER_V)
 
 /* APFC Constants */
 #define PF_TARGET          0.99f      /* switch whenever a step improves PF   */
-#define C_DEADBAND_UF      0.75f
+#define C_DEADBAND_UF      0.75f            /* hold if the bank is this close to C_need */
 #define CAP_RECLOSE_MS     5000u      /* min OFF time before a cap re-closes.
                                        * Without bleeder resistors the cap is
                                        * still charged after this; the
                                        * point-on-wave closing (RELAY_SYNC)
                                        * is what protects the contacts.       */
-#define APFC_V_MIN         10.0f
-#define APFC_P_MIN         0.5f
-#define PFC_SETTLE_WIN     2u
-#define TELEM_WIN          5u
+#define APFC_V_MIN         10.0f            /* below these the APFC sees no load */
+#define APFC_P_MIN         0.5f             /* and holds */
+#define PFC_SETTLE_WIN     2u               /* windows ignored after a switch */
+#define TELEM_WIN          5u               /* 5 windows = 0.5 s per decision/frame */
 
 /* Set to 1 to click R1, R2, R3 ON/OFF once at boot (bench test, mains off) */
 #define RELAY_SELFTEST     0u
 
 /* AHF Constants */
-#define PWM_PER_SAMPLE     8u
+#define PWM_PER_SAMPLE     8u               /* 8 PWM periods per sample */
 #define PWM_PERIOD_NOM     (TIM2_N_NOM / PWM_PER_SAMPLE)  /* 800 -> 80 kHz    */
 #define AHF_MOD_DEPTH      0.92f      /* max |duty| of the synthesised table  */
 #define AHF_MIN_HARM_A     0.02f      /* below this target peak, do not drive */
-#define AHF_PK_ALPHA       0.3f
-#define AHF_BOOT_ACTIVE    1u
+#define AHF_PK_ALPHA       0.3f             /* smoothing of the target peak */
+#define AHF_BOOT_ACTIVE    1u               /* 1 = AHF ACTIVE at power-up */
 
 #define AHF_HARM_MASK      0xFFFCu    /* bit h set = cancel harmonic h (2..15) */
 #define AHF_SENSE_GRID     0u         /* 0: sensor I sees the load current
@@ -170,18 +193,20 @@
 #define AHF_ID_MIN_DUTY    0.01f      /* identify G_h only when |U_h| > this  */
 #define AHF_LEAK           0.002f     /* slow forgetting of unused harmonics  */
 
+/* UART / telemetry */
 #define UART_BAUD          115200u
-#define WAVE_DECIM         2u
-#define TX_BUF_SZ          5632u
-#define RX_LINE_MAX        32u
+#define WAVE_DECIM         2u               /* send every 2nd sample (100 per cycle) */
+#define TX_BUF_SZ          5632u            /* one telemetry frame */
+#define RX_LINE_MAX        32u              /* longest command line */
 
+/* compile-time checks of the timing budget */
 _Static_assert(APB1_TIM_HZ / (N_CYC * 50u) / PWM_PER_SAMPLE <= 65535u, "TIM4 ARR is 16 bit");
 _Static_assert(APB1_TIM_HZ / PWM_PERIOD_NOM <= 100000u, "TB6612FNG max PWM is 100 kHz");
 _Static_assert((uint64_t)(ADC_SMP_CYCLES + 12u) * N_CH * N_CYC * 53u < ADC_CLK_HZ,
                "ADC scan does not fit in one sample period at PLL_F_MAX");
 
 /* ------------------------------------------------------------------------- */
-/*  Relay pins                                                               */
+/*  [S2] Relay pins and point-on-wave timing                                 */
 /* ------------------------------------------------------------------------- */
 /* PB0 = 2.5 uF, PB1 = 10 uF, PB2 = 20 uF. Each output is one of:
  *   relay module : 5 V active-LOW, open-drain. ON = sink LOW, OFF = float.
@@ -211,6 +236,10 @@ _Static_assert((uint64_t)(ADC_SMP_CYCLES + 12u) * N_CH * N_CYC * 53u < ADC_CLK_H
 #define RELAY_T_OP_MS      7.0f       /* coil ON  -> contacts closed (typ 5-9)*/
 #define RELAY_T_REL_MS     5.0f       /* coil OFF -> contacts open   (typ 2-8)*/
 #define RELAY_OPEN_LEAD_MS 2.0f       /* contacts part this long before +peak */
+/* Sample (0..199) at which each coil is switched; the +peak is sample 0:
+ *   K_ON 130      -> contacts close at the +peak
+ *   K_ON_ZERO 80  -> contacts close at the rising zero crossing
+ *   K_OFF 130     -> contacts open 2 ms before the +peak                   */
 #define RELAY_MS_TO_K(ms)  ((uint32_t)((ms) * (float)FS_HZ / 1000.0f + 0.5f))
 #define RELAY_K_PEAK       ((uint32_t)((float)N_CYC - ZMPT_LAG_DEG / 360.0f * (float)N_CYC) % N_CYC)
 #define RELAY_K_ON         ((RELAY_K_PEAK + 2u * N_CYC - RELAY_MS_TO_K(RELAY_T_OP_MS)) % N_CYC)
@@ -220,10 +249,11 @@ _Static_assert((uint64_t)(ADC_SMP_CYCLES + 12u) * N_CH * N_CYC * 53u < ADC_CLK_H
                              RELAY_MS_TO_K(RELAY_T_REL_MS)) % N_CYC)
 
 /* ========================================================================= */
-/*  DSP core - no register access (built and simulated on a PC by           */
+/*  [S3] DSP core - no register access (built and simulated on a PC by       */
 /*  firmware/test/run_sim.sh, which copies everything between the markers)   */
 /* ========================================================================= */
 /* DSP-CORE-BEGIN */
+/* complex numbers for harmonic phasors */
 typedef struct { float re, im; } cpx_t;
 
 static inline cpx_t c_mk(float re, float im)   { cpx_t z = { re, im }; return z; }
@@ -243,6 +273,7 @@ static inline cpx_t c_div(cpx_t a, cpx_t b)
 /* dft() gives x = a cos(h th) + b sin(h th); as a phasor that is a - jb.    */
 static inline cpx_t c_phasor(float a, float b) { return c_mk(a, -b); }
 
+/* wrap an angle into -pi..pi */
 static float wrap_pi(float x)
 {
     while (x >  3.14159265f) x -= TWO_PI;
@@ -250,9 +281,11 @@ static float wrap_pi(float x)
     return x;
 }
 
+/* one-cycle cos/sin tables for the DFT and the AHF synthesis */
 static float cos_t[N_CYC], sin_t[N_CYC];
-static float tan_phi_tgt;
+static float tan_phi_tgt;                   /* tan(acos(PF_TARGET)) = 0.1425 */
 
+/* 2nd-order IIR section (biquad) */
 typedef struct { float b0, b1, b2, a1, a2; } biquad_t;
 static biquad_t a_lpf;                  /* sensor A low-pass                  */
 static biquad_t vi_lpf;                 /* V/I display smoothing              */
@@ -271,6 +304,8 @@ static float    pll_ph_prev;
 static uint32_t pll_have_prev;
 static uint32_t pll_locked;             /* window start sits on the V peak    */
 
+/* Starting guess of the AHF plant gain: G_h = Vdc / (R + jwL) x PWM delay.
+ * Replaced by the measured value once the bridge runs.                     */
 static void ahf_model_init(void)
 {
     for (uint32_t h = 0; h <= MAX_H; h++) {
@@ -322,6 +357,7 @@ static void lpf_zero_phase(const biquad_t *f, float *x)
     }
 }
 
+/* build both filters and the sensor-A filter response at h = 0..15 */
 static void lpf_init(void)
 {
     butter2(A_LPF_HZ, &a_lpf);
@@ -338,6 +374,7 @@ static void lpf_init(void)
     }
 }
 
+/* one-time setup: sine tables, PF target, AHF model, filters */
 static void tables_init(void)
 {
     for (uint32_t k = 0; k < N_CYC; k++) {
@@ -351,6 +388,7 @@ static void tables_init(void)
     lpf_init();
 }
 
+/* DFT of one 200-sample cycle, h = 1..15:  x = a cos(h th) + b sin(h th) */
 static void dft(const float *x, float *a, float *b)
 {
     for (uint32_t h = 1; h <= MAX_H; h++) {
@@ -367,6 +405,7 @@ static void dft(const float *x, float *a, float *b)
     }
 }
 
+/* THD [%] = sqrt(h2^2 + ... + h15^2) / h1 */
 static float thd_pct(const float *h)
 {
     float s = 0.0f;
@@ -374,6 +413,7 @@ static float thd_pct(const float *h)
     return (h[1] > 1e-6f) ? 100.0f * sqrtf(s) / h[1] : 0.0f;
 }
 
+/* clear the AHF state (STANDBY) */
 static void ahf_reset(void)
 {
     memset(ahf_u, 0, sizeof ahf_u);
@@ -410,6 +450,7 @@ static void ahf_control(const float *ai, const float *bi, const float *aa, const
             }
         }
 
+        /* loop update: E_h = R_h - M_h,  U_h += mu * E_h / G_h */
         if (!drive) { ahf_u[h] = c_scale(ahf_u[h], 0.5f); continue; }
 #if AHF_SENSE_GRID
         const cpx_t e = c_scale(ii, -1.0f / AHF_INJ_RATIO);   /* grid residual */
@@ -448,6 +489,7 @@ static void ahf_control(const float *ai, const float *bi, const float *aa, const
     }
     ahf_duty_pk = pk;
 
+    /* to Q15, into the table the ISR is NOT playing */
     int16_t *t = ahf_tab[applied ^ 1u];
     for (uint32_t k = 0; k < N_CYC; k++) {
         const float f = u[k] * 32767.0f;
@@ -493,23 +535,28 @@ static void pll_period(float f, uint32_t *n, uint32_t *frac)
 /* DSP-CORE-END */
 
 /* ------------------------------------------------------------------------- */
-/*  Globals                                                                  */
+/*  [S4] Global variables                                                    */
 /* ------------------------------------------------------------------------- */
-static volatile uint16_t adc_buf[DMA_LEN];
-static uint16_t          snap[N_WIN * N_CH];
-static volatile int32_t  win_ready = -1;
+static volatile uint16_t adc_buf[DMA_LEN];  /* DMA target: 2 x 1000 scans x 3 ch */
+static uint16_t          snap[N_WIN * N_CH]; /* copy of the finished half */
+static volatile int32_t  win_ready = -1;    /* half ready (0/1), -1 = none */
 static volatile uint8_t  win_clean[2];      /* no table swap inside the half */
+/* error counters (sent in $R) */
 static volatile uint32_t win_dropped, adc_ovr_cnt, tx_skip;
-static volatile bool     resync_req;
+static volatile bool     resync_req;        /* ISR asks main to restart sampling */
 static volatile uint32_t ms_ticks;          /* advanced by the ADC DMA ISR   */
 
+/* TIM2 period from the PLL (whole ticks + fraction) and TIM4 period */
 static volatile uint32_t tim2_n = TIM2_N_NOM, tim2_frac, tim2_acc;
 static volatile uint32_t pwm_period = PWM_PERIOD_NOM;
 
+/* averaged one-cycle waveforms: V, I, A, after (I+A), AHF target */
 static float w_v[N_CYC], w_i[N_CYC], w_a[N_CYC], w_c[N_CYC], w_t[N_CYC];
+/* DFT coefficients of V, I, A */
 static float av[MAX_H + 1], bv[MAX_H + 1], ai[MAX_H + 1], bi[MAX_H + 1],
              aa[MAX_H + 1], ba[MAX_H + 1];
 
+/* results of one 100 ms window */
 typedef struct {
     float vrms, irms, p, s, pf, p1, q1, dpf, dva;
     float thd_v, thd_i, crest, vpk, ipk, apk, i_noise;
@@ -519,6 +566,7 @@ typedef struct {
     uint32_t clip[N_CH];
 } win_t;
 
+/* 0.5 s accumulation of window results, and its averages */
 typedef struct { float sv2, si2, p, p1, q1, vpk, ipk; uint32_t n; } acc_t;
 typedef struct { float vrms, irms, p, s, pf, p1, q1, dpf, dva, vpk, ipk; } avg_t;
 
@@ -526,12 +574,14 @@ static win_t   mw;
 static acc_t   acc;
 static uint32_t settle_win, win_count;
 
+/* AHF: table being played, swap request / done, sample index, ON/OFF */
 static volatile uint32_t ahf_sel, ahf_swap, ahf_swapped;
 static volatile uint32_t ahf_idx;
 static volatile uint32_t ahf_active = AHF_BOOT_ACTIVE;
 static float             ahf_ref_pk_f;
 static bool              ahf_is_reset;
 
+/* APFC: steps on PB0/PB1/PB2, manual locks ($C), actual/wanted bank */
 static const float       cap_uF[3] = { 2.5f, 10.0f, 20.0f };
 static volatile uint8_t  lock_mask = 0;
 static volatile uint8_t  lock_state = 0;
@@ -550,6 +600,7 @@ static uint32_t          relay_wait_ms[3];
 static float             lpf_z1, lpf_z2;    /* sensor A filter state           */
 static bool              lpf_primed;
 
+/* UART buffers and counters */
 static char              tx_buf[TX_BUF_SZ];
 static char             *tx_p;
 static volatile bool     tx_busy;
@@ -558,14 +609,16 @@ static uint32_t          rx_len;
 static volatile uint32_t cmd_ok, cmd_bad, rx_bytes;
 
 /* ------------------------------------------------------------------------- */
-/*  System Initialization                                                    */
+/*  [S5] Clock tree, GPIO, relay outputs                                     */
 /* ------------------------------------------------------------------------- */
+/* HSI 16 MHz -> PLL -> 64 MHz SYSCLK; APB1 32 MHz, APB2 64 MHz */
 static void clock_init(void)
 {
     RCC->APB1ENR |= RCC_APB1ENR_PWREN;
     (void)RCC->APB1ENR;
-    PWR->CR = (PWR->CR & ~PWR_CR_VOS) | (2u << PWR_CR_VOS_Pos);
+    PWR->CR = (PWR->CR & ~PWR_CR_VOS) | (2u << PWR_CR_VOS_Pos); /* regulator scale 2 */
 
+    /* 2 flash wait states + prefetch and caches for 64 MHz */
     FLASH->ACR = FLASH_ACR_LATENCY_2WS | FLASH_ACR_PRFTEN | FLASH_ACR_ICEN | FLASH_ACR_DCEN;
     while ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_2WS) {}
 
@@ -576,6 +629,7 @@ static void clock_init(void)
     RCC->CR &= ~RCC_CR_PLLON;
     while (RCC->CR & RCC_CR_PLLRDY) {}
 
+    /* 16 MHz / M16 x N256 / P4 (code 1) = 64 MHz */
     RCC->PLLCFGR = (16u  << RCC_PLLCFGR_PLLM_Pos) |
                    (256u << RCC_PLLCFGR_PLLN_Pos) |
                    (1u   << RCC_PLLCFGR_PLLP_Pos) |
@@ -584,6 +638,7 @@ static void clock_init(void)
     RCC->CR |= RCC_CR_PLLON;
     while (!(RCC->CR & RCC_CR_PLLRDY)) {}
 
+    /* AHB /1, APB1 /2, APB2 /1, switch SYSCLK to the PLL */
     RCC->CFGR = RCC_CFGR_HPRE_DIV1 | RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_PPRE2_DIV1 | RCC_CFGR_SW_PLL;
     while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) {}
     SystemCoreClock = SYSCLK_HZ;
@@ -599,6 +654,7 @@ static uint32_t relay_bsrr(uint8_t bits, uint8_t st)
     return hi | ((m & ~hi) << 16);
 }
 
+/* set all three capacitor outputs at once */
 static void relay_write(uint8_t st)
 {
     GPIOB->BSRR = relay_bsrr(7u, st);
@@ -622,6 +678,7 @@ static inline void relay_isr_step(uint32_t i)
     }
 }
 
+/* PA0/PA1/PA4 analog, PA2/PA3 UART, PA5 LED, PB0-PB2 relays, PB6/PB8 PWM */
 static void gpio_init(void)
 {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN |
@@ -686,8 +743,9 @@ static void relay_selftest(void)
 #endif
 
 /* ========================================================================= */
-/*  TIM2 (grid-locked sample clock), ADC1 + DMA2 Stream0                     */
+/*  [S6] TIM2 (grid-locked sample clock), ADC1 + DMA2 Stream0                */
 /* ========================================================================= */
+/* 10 kHz sample clock: 64 MHz / 6400. Update = TRGO (starts the ADC) + IRQ */
 static void tim2_init(void)
 {
     RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
@@ -702,18 +760,23 @@ static void tim2_init(void)
     TIM2->DIER = TIM_DIER_UIE;
 }
 
+/* ADC1 scans IN0 (I), IN1 (V), IN4 (A) on every TIM2 trigger.
+ * DMA2 Stream0 copies each result into adc_buf (circular, HT + TC IRQs).  */
 static void adc_dma_init(void)
 {
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
     (void)RCC->APB2ENR;
 
     ADC->CCR    = (1u << ADC_CCR_ADCPRE_Pos);                  /* PCLK2 / 4  */
-    ADC1->CR1   = ADC_CR1_SCAN | ADC_CR1_OVRIE;
+    ADC1->CR1   = ADC_CR1_SCAN | ADC_CR1_OVRIE; /* scan mode, overrun IRQ */
+    /* 480 cycles on each channel */
     ADC1->SMPR2 = (ADC_SMP_CODE << ADC_SMPR2_SMP0_Pos) |
                   (ADC_SMP_CODE << ADC_SMPR2_SMP1_Pos) |
                   (ADC_SMP_CODE << ADC_SMPR2_SMP4_Pos);
-    ADC1->SQR1  = (N_CH - 1u) << ADC_SQR1_L_Pos;
+    ADC1->SQR1  = (N_CH - 1u) << ADC_SQR1_L_Pos; /* 3 conversions */
+    /* scan order: IN0 (I), IN1 (V), IN4 (A) */
     ADC1->SQR3  = (0u << ADC_SQR3_SQ1_Pos) | (1u << ADC_SQR3_SQ2_Pos) | (4u << ADC_SQR3_SQ3_Pos);
+    /* trigger = TIM2_TRGO, rising edge; DDS keeps DMA requests going */
     ADC1->CR2   = (6u << ADC_CR2_EXTSEL_Pos) |
                   (1u << ADC_CR2_EXTEN_Pos)  |
                   ADC_CR2_DDS | ADC_CR2_ADON;
@@ -724,11 +787,13 @@ static void adc_dma_init(void)
     DMA2_Stream0->M0AR = (uint32_t)adc_buf;
     DMA2_Stream0->NDTR = DMA_LEN;
     DMA2_Stream0->FCR  = 0;
+    /* channel 0, 16-bit, memory increment, circular, half + full IRQ */
     DMA2_Stream0->CR   = (0u << DMA_SxCR_CHSEL_Pos) | DMA_SxCR_PL_1 |
                          DMA_SxCR_MSIZE_0 | DMA_SxCR_PSIZE_0 | DMA_SxCR_MINC |
                          DMA_SxCR_CIRC | DMA_SxCR_HTIE | DMA_SxCR_TCIE | DMA_SxCR_TEIE;
 }
 
+/* hand a finished half-buffer to the main loop */
 static inline void win_post(int32_t half)
 {
     if (win_ready >= 0) win_dropped++;
@@ -740,6 +805,7 @@ static inline void win_post(int32_t half)
     ms_ticks += WIN_MS;               /* each half-buffer = 5 grid cycles */
 }
 
+/* DMA2: half-transfer = half 0 ready, transfer-complete = half 1 ready */
 void DMA2_Stream0_IRQHandler(void)
 {
     uint32_t isr = DMA2->LISR;
@@ -748,6 +814,7 @@ void DMA2_Stream0_IRQHandler(void)
     if (isr & DMA_LISR_TCIF0) { DMA2->LIFCR = DMA_LIFCR_CTCIF0; win_post(1); }
 }
 
+/* ADC overrun: count it and restart sampling */
 void ADC_IRQHandler(void)
 {
     if (ADC1->SR & ADC_SR_OVR) {
@@ -758,8 +825,9 @@ void ADC_IRQHandler(void)
 }
 
 /* ========================================================================= */
-/*  TIM4  -  80 kHz TB6612FNG PWM, reset by every TIM2 update                */
+/*  [S7] TIM4 - 80 kHz TB6612FNG PWM, reset by every TIM2 update             */
 /* ========================================================================= */
+/* PWM on CH1 (PB6 -> AIN1) and CH3 (PB8 -> AIN2), 64 MHz / 800 = 80 kHz */
 static void tim4_init(void)
 {
     RCC->APB1ENR |= RCC_APB1ENR_TIM4EN;
@@ -767,6 +835,7 @@ static void tim4_init(void)
     TIM4->CR1   = TIM_CR1_ARPE;               /* URS = 0: reset loads CCRs */
     TIM4->PSC   = 0;
     TIM4->ARR   = PWM_PERIOD_NOM - 1u;
+    /* PWM mode 1 with preload */
     TIM4->CCMR1 = (6u << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
     TIM4->CCMR2 = (6u << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
     TIM4->CCR1  = 0;
@@ -778,7 +847,8 @@ static void tim4_init(void)
     TIM4->DIER  = 0;
 }
 
-/* One sample: trim the sample period (grid lock) and step the AHF table. */
+/* Every sample (10 kHz, highest priority): trim the sample period (grid
+ * lock), step the AHF duty table and fire any scheduled relay coil.      */
 void TIM2_IRQHandler(void)
 {
     TIM2->SR = ~TIM_SR_UIF;
@@ -788,6 +858,7 @@ void TIM2_IRQHandler(void)
     tim2_acc  = a & 0xFFFFu;
     TIM2->ARR = tim2_n - 1u + (a >> 16);
 
+    /* next sample of the AHF table; new table only at the cycle start */
     const uint32_t i = ahf_idx;
     if (i == 0u && ahf_swap) { ahf_sel ^= 1u; ahf_swap = 0u; ahf_swapped = 1u; }
     ahf_idx = (i + 1u < N_CYC) ? i + 1u : 0u;
@@ -814,6 +885,7 @@ void TIM2_IRQHandler(void)
     }
 }
 
+/* (Re)start sampling cleanly: DMA at the buffer start, TIM4 and TIM2 aligned */
 static void sampling_sync_start(void)
 {
     __disable_irq();
@@ -868,14 +940,15 @@ static void pll_apply(void)
 }
 
 /* ========================================================================= */
-/*  UART & Command Parsing                                                   */
+/*  [S8] UART & Command Parsing                                              */
 /* ========================================================================= */
+/* USART2 115200 8N1 on PA2/PA3 (ST-LINK USB); TX by DMA1 Stream6, RX by IRQ */
 static void uart_init(void)
 {
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
     (void)RCC->APB1ENR;
     USART2->CR1 = 0;
-    USART2->BRR = (APB1_HZ + UART_BAUD / 2u) / UART_BAUD;
+    USART2->BRR = (APB1_HZ + UART_BAUD / 2u) / UART_BAUD; /* 32 MHz / 115200 = 278 */
     USART2->CR3 = USART_CR3_DMAT;
     USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
 
@@ -887,6 +960,7 @@ static void uart_init(void)
                         DMA_SxCR_DIR_0 | DMA_SxCR_TCIE | DMA_SxCR_TEIE;
 }
 
+/* send len bytes of tx_buf in the background; false if still busy */
 static bool uart_tx_dma(uint32_t len)
 {
     if (tx_busy || len == 0u) return false;
@@ -902,6 +976,7 @@ static bool uart_tx_dma(uint32_t len)
     return true;
 }
 
+/* TX DMA finished: buffer free again */
 void DMA1_Stream6_IRQHandler(void)
 {
     uint32_t isr = DMA1->HISR;
@@ -911,6 +986,7 @@ void DMA1_Stream6_IRQHandler(void)
     }
 }
 
+/* parse a small unsigned number; 0 on error */
 static const char *parse_u(const char *p, uint32_t *v)
 {
     if (*p < '0' || *p > '9') return 0;
@@ -923,6 +999,9 @@ static const char *parse_u(const char *p, uint32_t *v)
     return p;
 }
 
+/* Commands from the dashboard:
+ *   $C,<cap 0-2>,<0 auto | 1 manual>,<0 off | 1 on>   capacitor override
+ *   $A,<0 standby | 1 active>                          AHF on/off       */
 static void cmd_exec(const char *s)
 {
     const char *p;
@@ -956,6 +1035,7 @@ bad:
     cmd_bad++;
 }
 
+/* collect a line from '$' to newline, then run it */
 static void rx_feed(char ch)
 {
     if (ch == '$') { rx_line[0] = ch; rx_len = 1; return; }
@@ -969,6 +1049,7 @@ static void rx_feed(char ch)
     else { rx_len = 0; cmd_bad++; }
 }
 
+/* one received byte */
 void USART2_IRQHandler(void)
 {
     uint32_t sr = USART2->SR;
@@ -981,8 +1062,13 @@ void USART2_IRQHandler(void)
 }
 
 /* ========================================================================= */
-/*  Signal Processing                                                        */
+/*  [S9] Signal processing of one 100 ms window                              */
 /* ========================================================================= */
+/* 1000 scans -> measurements of one window:
+ *   1. offsets, min/max, clipping; fold 5 cycles into one averaged cycle
+ *   2. Vrms, Irms (sensor noise removed), P, S, PF, crest factor
+ *   3. DFT h1..h15 of V, I, A -> P1, Q1, DPF, distortion power D, THD
+ *   4. after-compensation estimate (I + A) and the display waveforms     */
 static void process_window(const uint16_t *s, win_t *m)
 {
     static uint32_t csum[N_CH][N_CYC];
@@ -999,6 +1085,7 @@ static void process_window(const uint16_t *s, win_t *m)
     }
     for (uint32_t c = 0; c < N_CH; c++) { m->mn[c] = 0xFFFFu; m->mx[c] = 0; m->clip[c] = 0; }
 
+    /* pass 1: statistics, cycle folding, sensor-A low-pass */
     for (uint32_t n = 0, k = 0; n < N_WIN; n++) {
         const uint16_t *x = &s[n * N_CH];
         for (uint32_t c = 0; c < N_CH; c++) {
@@ -1018,6 +1105,7 @@ static void process_window(const uint16_t *s, win_t *m)
     }
     for (uint32_t c = 0; c < N_CH; c++) m->off[c] = (float)sum[c] / (float)N_WIN;
 
+    /* pass 2: rms and real power from the raw samples */
     const float oi = m->off[SLOT_I], ov = m->off[SLOT_V], oa = m->off[SLOT_A];
     float si2 = 0, sv2 = 0, svi = 0, ipk = 0, vpk = 0;
     for (uint32_t n = 0; n < N_WIN; n++) {
@@ -1056,6 +1144,7 @@ static void process_window(const uint16_t *s, win_t *m)
         ipk        = cpk;
     }
 
+    /* deadbands: noise only -> 0 */
     if (m->vrms < V_DEADBAND) { m->vrms = 0.0f; vpk = 0.0f; }
     if (m->irms < I_DEADBAND) { m->irms = 0.0f; ipk = 0.0f; }
 
@@ -1066,6 +1155,7 @@ static void process_window(const uint16_t *s, win_t *m)
     m->vpk   = vpk;
     m->crest = (m->irms > 1e-4f) ? ipk / m->irms : 0.0f;
 
+    /* averaged cycle in volts / amps */
     const float inv = 1.0f / (float)CYC_PER_WIN;
     float apk = 0.0f;
     for (uint32_t k = 0; k < N_CYC; k++) {
@@ -1075,6 +1165,7 @@ static void process_window(const uint16_t *s, win_t *m)
         if (fabsf(w_a[k]) > apk) apk = fabsf(w_a[k]);
     }
 
+    /* harmonics */
     dft(w_i, ai, bi);
     dft(w_v, av, bv);
     dft(w_a, aa, ba);
@@ -1109,6 +1200,7 @@ static void process_window(const uint16_t *s, win_t *m)
         for (uint32_t k = 0; k < N_CYC; k++) if (fabsf(w_a[k]) > apk) apk = fabsf(w_a[k]);
     }
     m->apk = apk;
+    /* harmonic rms values and THD */
     float hv[MAX_H + 1];
     for (uint32_t h = 1; h <= MAX_H; h++) {
         m->h_i[h] = 0.70710678f * sqrtf(ai[h] * ai[h] + bi[h] * bi[h]);
@@ -1119,6 +1211,7 @@ static void process_window(const uint16_t *s, win_t *m)
     m->thd_i = (m->irms > 0.0f) ? thd_pct(m->h_i) : 0.0f;
     m->thd_v = (m->vrms > 0.0f) ? thd_pct(hv)     : 0.0f;
 
+    /* fundamental P1, Q1 with the V-I sampling skew rotated out */
     if (m->vrms > 0.0f && m->irms > 0.0f) {
         const float ph = ZMPT_LAG_DEG * 0.01745329f -
                          TWO_PI * pll_f_est * ADC_SLOT_S * (float)(SLOT_V - SLOT_I);
@@ -1155,6 +1248,7 @@ static void process_window(const uint16_t *s, win_t *m)
     if (m->irms > 0.0f) lpf_zero_phase(&vi_lpf, w_i);
 
     for (uint32_t k = 0; k < N_CYC; k++) {
+        /* AHF target = -(I - I1): everything except the fundamental */
         float i_fund = ai[1] * cos_t[k] + bi[1] * sin_t[k];
         w_t[k] = -(w_i[k] - i_fund);
 #if AHF_SENSE_GRID
@@ -1165,7 +1259,10 @@ static void process_window(const uint16_t *s, win_t *m)
     }
 }
 
-/* clean: the AHF table did not change during this window, so sensor A shows
+/* ========================================================================= */
+/*  [S10] Control: AHF step, APFC decision, relay switching                  */
+/* ========================================================================= */
+/* One AHF update per window. clean: the AHF table did not change during this window, so sensor A shows
  * the response to exactly one known table (needed for identification).    */
 static void ahf_step(bool clean)
 {
@@ -1187,14 +1284,17 @@ static void ahf_step(bool clean)
     ahf_swap = 1u;
 }
 
+/* capacitance switched in for bank state st (bit i = cap i) */
 static float cap_sum(uint8_t st)
 {
     return ((st & 1u) ? cap_uF[0] : 0.0f) + ((st & 2u) ? cap_uF[1] : 0.0f) +
            ((st & 4u) ? cap_uF[2] : 0.0f);
 }
 
+/* number of relays that differ */
 static uint32_t popcnt3(uint8_t x) { return (x & 1u) + ((x >> 1) & 1u) + ((x >> 2) & 1u); }
 
+/* 0.5 s averaging of the window results */
 static void acc_reset(void) { memset(&acc, 0, sizeof acc); }
 
 static void acc_add(const win_t *m)
@@ -1228,6 +1328,7 @@ static void make_avg(avg_t *a, const win_t *m)
     a->dva = (d2 > 0.0f) ? sqrtf(d2) : 0.0f;
 }
 
+/* read the manual locks atomically */
 static void locks_read(uint8_t *mask, uint8_t *st)
 {
     __disable_irq();
@@ -1236,11 +1337,16 @@ static void locks_read(uint8_t *mask, uint8_t *st)
     __enable_irq();
 }
 
+/* APFC decision, every 0.5 s:
+ *   C_need = (Q_load - |P1| tan(phi_target)) / (2 pi f V^2)
+ *   choose the allowed step combination closest to C_need (fewest relay
+ *   changes on a tie); hold if the present bank is within C_DEADBAND_UF. */
 static void apfc_step(const avg_t *a)
 {
     uint8_t mask, lst;
     locks_read(&mask, &lst);
 
+    /* all steps manual: just apply them */
     if (mask == 7u) {
         relay_target = lst;
         pfc_hold = 1;
@@ -1251,6 +1357,7 @@ static void apfc_step(const avg_t *a)
 
     const uint8_t cur = (uint8_t)((relay_target & ~mask) | (lst & mask));
 
+    /* load's own Q = measured Q1 + vars of the caps already ON */
     float c_need = 0.0f;
     if (a->vrms >= APFC_V_MIN && fabsf(a->p1) >= APFC_P_MIN) {
         const float k      = TWO_PI * pll_f_est * a->vrms * a->vrms * 1e-6f;
@@ -1261,6 +1368,7 @@ static void apfc_step(const avg_t *a)
     }
     pfc_c_need = c_need;
 
+    /* try all 8 combinations */
     const float e_cur = fabsf(cap_sum(cur) - c_need);
     uint8_t best = cur;
     float   e_best = e_cur;
@@ -1276,11 +1384,15 @@ static void apfc_step(const avg_t *a)
     if (best != cur && e_cur > C_DEADBAND_UF) { relay_target = (uint8_t)((best & ~mask) | (lst & mask)); pfc_hold = 0; }
     else                                      { relay_target = cur;  pfc_hold = 1; }
 
+    /* why the bank holds, for the dashboard */
     if (a->vrms < APFC_V_MIN || fabsf(a->p1) < APFC_P_MIN) pfc_reason = 1u;
     else if (pfc_hold && cur == 0u && c_need > 0.0f)       pfc_reason = 2u;
     else                                                   pfc_reason = 0u;
 }
 
+/* Moves the relays toward relay_target, obeying min ON / min OFF time.
+ * Relay modules are handed to the TIM2 ISR (point-on-wave); SSRs, or any
+ * relay while the mains is absent, switch at once.                      */
 static void relay_service(uint32_t now)
 {
     uint8_t mask, lst;
@@ -1333,8 +1445,9 @@ static void relay_service(uint32_t now)
 }
 
 /* ========================================================================= */
-/*  Telemetry                                                                */
+/*  [S11] Telemetry                                                          */
 /* ========================================================================= */
+/* text helpers: char, string, unsigned, fixed-point float */
 static void tx_c(char c) { if (tx_p < tx_buf + TX_BUF_SZ) *tx_p++ = c; }
 static void tx_s(const char *s) { while (*s) tx_c(*s++); }
 
@@ -1364,6 +1477,7 @@ static void tx_f(float x, uint32_t dec)
 static void tx_cf(float x, uint32_t dec) { tx_c(','); tx_f(x, dec); }
 static void tx_cu(uint32_t v)            { tx_c(','); tx_u(v); }
 
+/* $W,<tag>: one averaged cycle, every 2nd sample */
 static void tx_wave(char tag, const float *w, uint32_t dec)
 {
     tx_s("$W,"); tx_c(tag);
@@ -1371,6 +1485,7 @@ static void tx_wave(char tag, const float *w, uint32_t dec)
     tx_c('\n');
 }
 
+/* build one frame in tx_buf and send it by DMA (skipped if still busy) */
 static void telemetry_send(const win_t *m, const avg_t *a)
 {
     if (tx_busy) { tx_skip++; return; }
@@ -1382,6 +1497,7 @@ static void telemetry_send(const win_t *m, const avg_t *a)
     tx_wave('T', w_t, 3);
     tx_wave('C', w_c, 3);
 
+    /* $M main measurements (0.5 s averages) */
     tx_s("$M");
     tx_cf(a->vrms, 2); tx_cf(a->irms, 4); tx_cf(a->p, 2);   tx_cf(a->s, 2);
     tx_cf(a->q1, 2);   tx_cf(a->pf, 4);   tx_cf(m->thd_v, 2); tx_cf(m->thd_i, 2);
@@ -1389,22 +1505,27 @@ static void telemetry_send(const win_t *m, const avg_t *a)
     tx_cf(a->dva, 2);  tx_cf(pll_f_est, 3);
     tx_c('\n');
 
+    /* $H harmonic rms: grid I, AHF A, after C */
     tx_s("$H,I"); for (uint32_t h = 1; h <= MAX_H; h++) tx_cf(m->h_i[h], 4); tx_c('\n');
     tx_s("$H,A"); for (uint32_t h = 1; h <= MAX_H; h++) tx_cf(m->h_a[h], 4); tx_c('\n');
     tx_s("$H,C"); for (uint32_t h = 1; h <= MAX_H; h++) tx_cf(m->h_c[h], 4); tx_c('\n');
 
     uint8_t mask, lst;
     locks_read(&mask, &lst);
+    /* $P APFC state */
     tx_s("$P"); tx_cu(relay_state); tx_cf(cap_sum(relay_state), 1); tx_cf(a->pf, 4);
     tx_cf(a->q1, 2); tx_cu(pfc_hold); tx_cu(relay_target); tx_cf(pfc_c_need, 2);
     tx_cu(pll_locked); tx_cu(pfc_reason); tx_cu(relay_waiting); tx_c('\n');
 
+    /* $A AHF state */
     tx_s("$A"); tx_cu(ahf_active); tx_cf(m->apk, 4); tx_cf(ahf_ref_pk_f, 4);
     tx_cf(ahf_duty_pk, 3); tx_cf(ahf_resid_pct, 1); tx_cf(m->thd_c, 2); tx_c('\n');
 
+    /* $K manual locks and command counters */
     tx_s("$K"); tx_cu(mask); tx_cu(lst); tx_cu(cmd_ok); tx_cu(cmd_bad); tx_cu(rx_bytes);
     tx_c('\n');
 
+    /* $R ADC diagnostics and error counters */
     tx_s("$R");
     static const uint32_t order[N_CH] = { SLOT_V, SLOT_I, SLOT_A };
     for (uint32_t j = 0; j < N_CH; j++) {
@@ -1414,13 +1535,15 @@ static void telemetry_send(const win_t *m, const avg_t *a)
     tx_cu(adc_ovr_cnt); tx_cu(win_dropped); tx_cu(tx_skip); tx_cf(m->i_noise, 4);
     tx_c('\n');
 
+    /* $E end of frame: dashboard commits it */
     tx_s("$E\n");
     uart_tx_dma((uint32_t)(tx_p - tx_buf));
 }
 
 /* ========================================================================= */
-/*  Main                                                                     */
+/*  [S12] Interrupt priorities, window handler, main()                       */
 /* ========================================================================= */
+/* lower number = higher priority; TIM2 must never wait (PWM + relay timing) */
 static void nvic_init(void)
 {
     NVIC_SetPriority(TIM2_IRQn,         0);
@@ -1435,6 +1558,7 @@ static void nvic_init(void)
     NVIC_EnableIRQ(DMA1_Stream6_IRQn);
 }
 
+/* everything done once per 100 ms window */
 static void on_window(bool clean)
 {
     process_window(snap, &mw);
@@ -1446,7 +1570,7 @@ static void on_window(bool clean)
     if (settle_win) settle_win--;
     else            acc_add(&mw);
 
-    if (++win_count >= TELEM_WIN) {
+    if (++win_count >= TELEM_WIN) {         /* every 0.5 s */
         win_count = 0;
         avg_t a;
         make_avg(&a, &mw);
@@ -1459,7 +1583,7 @@ static void on_window(bool clean)
 
 int main(void)
 {
-    SCB->CPACR |= (0xFu << 20);
+    SCB->CPACR |= (0xFu << 20);             /* enable the FPU */
     __DSB(); __ISB();
 
     clock_init();
@@ -1475,10 +1599,11 @@ int main(void)
     nvic_init();
     sampling_sync_start();
 
+    /* main loop: relays, then any finished window, else sleep */
     for (;;) {
         if (resync_req) {
             resync_req = false;
-            sampling_sync_start();
+            sampling_sync_start();          /* after a DMA/ADC error */
         }
 
         pfc_cmd_pending = false;
@@ -1494,7 +1619,7 @@ int main(void)
             memcpy(snap, (const void *)&adc_buf[(uint32_t)half * N_WIN * N_CH], sizeof snap);
             on_window(clean);
         } else {
-            __WFI();
+            __WFI();                        /* sleep until the next interrupt */
         }
     }
 }
